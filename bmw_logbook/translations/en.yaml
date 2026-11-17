@@ -1,0 +1,13 @@
+configuration:
+  vehicles:
+    name: Vehicles
+    description: One entry per vehicle (id, plate, make, model, powertrain, VIN, driver, charging pause settings and Home Assistant entities).
+  export_dir:
+    name: Export folder
+    description: Folder for reports, archive and backups (uploaded to Drive by Rclone Backup).
+  trip_end_timeout_s:
+    name: Trip end timeout (s)
+    description: How long the car must be stationary before the trip ends.
+  ghost_motion_max_s:
+    name: Ghost motion max duration (s)
+    description: Short motion "on" periods without movement are ignored.
