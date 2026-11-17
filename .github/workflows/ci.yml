@@ -38,4 +38,5 @@ jobs:
             --test \
             --amd64 \
             --target /data/bmw_logbook \
+            --image "bmw-logbook-{arch}" \
             --docker-hub ghcr.io/zuiker1974
