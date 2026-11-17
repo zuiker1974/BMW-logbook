@@ -1,0 +1,112 @@
+name: BMW-ajopäiväkirja
+version: "0.1.0"
+slug: bmw_logbook
+description: Automaattinen ajopäiväkirja BMW-autoille Home Assistantin CarData-datasta (530e, iX3)
+url: https://github.com/zuiker1974/bmw-logbook
+arch:
+  - aarch64
+  - amd64
+init: false
+ingress: true
+panel_icon: mdi:car-clock
+panel_title: BMW-ajopäiväkirja
+homeassistant_api: true
+services:
+  - mqtt:want
+map:
+  - share:rw
+options:
+  vehicles:
+    - id: "530e"
+      plate: ""
+      make: BMW
+      model: 530e xDrive (G30)
+      powertrain: PHEV
+      vin: ""
+      driver: ""
+      enabled: true
+      charging_pause_enabled: true
+      charging_pause_timeout_s: 2700
+      entity_location: device_tracker.530e_xdrive_location
+      entity_odometer: sensor.530e_xdrive_vehicle_mileage
+      entity_motion: binary_sensor.autot_530e_xdrive_vehicle_motion_state
+      entity_soc: sensor.530e_xdrive_battery_ev_state_of_charge
+      entity_charging_state: sensor.charging_ev_charging_state
+      entity_charging_method: sensor.charging_ev_charging_method
+      entity_hv_system_state: sensor.charging_ev_hv_system_state
+    - id: ix3
+      plate: ""
+      make: BMW
+      model: iX3 (NA5)
+      powertrain: BEV
+      vin: ""
+      driver: ""
+      enabled: false
+      charging_pause_enabled: true
+      charging_pause_timeout_s: 5400
+      entity_location: ""
+      entity_odometer: ""
+      entity_motion: ""
+      entity_soc: ""
+      entity_charging_state: ""
+      entity_charging_method: ""
+      entity_hv_system_state: ""
+  export_dir: /share/ajopaivakirja
+  month_folder_format: "%m"
+  trip_start_distance_m: 100
+  trip_end_timeout_s: 600
+  ghost_motion_max_s: 90
+  home_zones:
+    - zone.home
+  stream_status_entity: sensor.cardata_debug_device_stream_connection_status
+  backfill_max_hours: 24
+  ha_mqtt_enabled: true
+  report_xlsx: true
+  report_csv: false
+  xlsx_import_poll_s: 60
+  odometer_gap_tolerance_km: 1
+  auto_lock_after_days: 15
+  commute_counts_as_private: true
+  archive_filtered:
+    - business
+  nominatim_user_agent: bmw-logbook-fi/0.1
+  log_level: info
+schema:
+  vehicles:
+    - id: match(^[a-z0-9_]{2,16}$)
+      plate: str
+      make: str
+      model: str
+      powertrain: list(PHEV|BEV)
+      vin: match(^$|^[A-HJ-NPR-Z0-9]{17}$)
+      driver: str
+      enabled: bool
+      charging_pause_enabled: bool
+      charging_pause_timeout_s: int(0,86400)
+      entity_location: str?
+      entity_odometer: str?
+      entity_motion: str?
+      entity_soc: str?
+      entity_charging_state: str?
+      entity_charging_method: str?
+      entity_hv_system_state: str?
+  export_dir: str
+  month_folder_format: str
+  trip_start_distance_m: int(10,5000)
+  trip_end_timeout_s: int(60,7200)
+  ghost_motion_max_s: int(0,600)
+  home_zones:
+    - str
+  stream_status_entity: str?
+  backfill_max_hours: int(0,240)
+  ha_mqtt_enabled: bool
+  report_xlsx: bool
+  report_csv: bool
+  xlsx_import_poll_s: int(10,3600)
+  odometer_gap_tolerance_km: float(0,50)
+  auto_lock_after_days: int(0,365)
+  commute_counts_as_private: bool
+  archive_filtered:
+    - list(business|private|commute)
+  nominatim_user_agent: str
+  log_level: list(debug|info|warning|error)
