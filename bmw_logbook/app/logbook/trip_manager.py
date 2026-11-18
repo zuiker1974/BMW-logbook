@@ -11,6 +11,12 @@ historiapaikkauksessa ja testeissä.
   haamujakso (off -> on 30 s -> off), jonka aikana auto ei liiku -> lyhyt on-jakso, jonka
   aikana mittarilukema ei kasva, ei ole liikettä (ghost_motion_max_s);
 * mittarilukema (1 km tarkkuus) tulee noin 5 s liiketilan off-tilan jälkeen.
+
+Lisähavainnot 18.11.2026 (tests/test_replay_2026_11_18.py):
+* haamujakso voi olla myös off -> 30 s -> on 7 min -> off. Ajon aikana pitkäkin on-jakso,
+  jonka aikana auto ei siirry eikä mittari kasva, on haamu, jos ajolla on jo pysähdys;
+* liiketilan off voi tulla noin 5 min todellisen pysähdyksen jälkeen. Mittarilukeman
+  timestamp-attribuutti kertoo todellisen pysähdyshetken, joten sitä käytetään loppuaikana.
 """
 from __future__ import annotations
 
@@ -44,6 +50,8 @@ INVALID_STATES = {"unavailable", "unknown", "none", ""}
 MOVE_THRESHOLD_M = 50  # ajon aikana tätä pienempi siirtymä on GPS-kohinaa
 LATE_DATA_WINDOW_S = 120  # pysähdyksen jälkeen saapuva viimeinen sijainti/mittari kuuluu vielä ajoon
 STUCK_MOTION_FACTOR = 3  # liiketila jumissa "on": päätetään, jos liikettä ei ole 3 x aikakatkaisu
+MAX_END_HINT_S = 900  # mittarin aikaleima saa aikaistaa loppuaikaa enintään 15 min
+STOPPED_LABEL = "Pysähtynyt"  # ajo ei vielä päättynyt, mutta auto seisoo (odotetaan aikakatkaisua)
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -93,6 +101,8 @@ class Segment:
     odo_increased: bool = False
     loc_at_on: list | None = None
     loc_far: bool = False
+    moved: bool = False  # sijainti siirtyi jakson aikana (> MOVE_THRESHOLD_M)
+    ghost: bool = False  # jakso tulkittiin haamuliikkeeksi
 
 
 @dataclass
@@ -111,6 +121,8 @@ class ActiveTrip:
     path_m: float = 0.0
     charging_stops: list = field(default_factory=list)
     current_stop: dict | None = None
+    last_moved_time: str | None = None  # viimeinen sijainti, jossa auto oli siirtynyt
+    end_hint: str | None = None  # mittarilukeman oma aikaleima pysähdyksen jälkeen
 
 
 @dataclass
@@ -131,6 +143,7 @@ class MachineState:
     parked_odometer: float | None = None
     parked_soc: float | None = None
     parked_since: str | None = None
+    first_move_ts: str | None = None  # ensimmäinen pieni siirtymä pysäköintipaikalta
     trip: ActiveTrip | None = None
 
 
@@ -181,6 +194,15 @@ class TripManager:
 
     @property
     def status_label(self) -> str:
+        t = self.s.trip
+        if (
+            self.s.state == DRIVING
+            and t is not None
+            and self.has_motion
+            and self.s.motion is False
+            and t.stop_time is not None
+        ):
+            return STOPPED_LABEL
         return STATUS_LABELS.get(self.s.state, self.s.state)
 
     @property
@@ -214,11 +236,16 @@ class TripManager:
         ts_iso = timeutil.to_iso(ev.ts)
         if self.s.last_ts and ts_iso < self.s.last_ts:
             ts_iso = self.s.last_ts  # myöhässä tullut tapahtuma: ei siirretä aikaa taaksepäin
+        if self.s.trip is not None and self.s.state != IDLE:
+            # Aikakatkaisut tarkistetaan ennen uutta tapahtumaa. Live-tilassa ajastin tekee
+            # tämän 15 s välein, mutta historiapaikkauksessa muuten pitkän pysähdyksen jälkeinen
+            # liike yhdistäisi kaksi ajoa.
+            self.tick(timeutil.parse_iso(ts_iso))
         changed = False
         if ev.role == "location":
             changed = self._on_location(ev.attributes or {}, ts_iso)
         elif ev.role == "odometer":
-            changed = self._on_odometer(state, ts_iso)
+            changed = self._on_odometer(state, ts_iso, ev.attributes or {})
         elif ev.role == "motion":
             changed = self._on_motion(state.lower(), ts_iso)
         elif ev.role == "soc":
@@ -256,6 +283,11 @@ class TripManager:
                 self._set_parked(lat, lon, self.s.odometer, ts)
                 return True
             dist = haversine_m(self.s.parked_lat, self.s.parked_lon, lat, lon)
+            if dist > MOVE_THRESHOLD_M and (
+                self.s.first_move_ts is None
+                or _secs(self.s.first_move_ts, ts) > self.settings.trip_end_timeout_s
+            ):
+                self.s.first_move_ts = ts
             if self.s.segment and self.s.segment.off is None and self.s.segment.loc_at_on:
                 if haversine_m(*self.s.segment.loc_at_on, lat, lon) > self.settings.trip_start_distance_m:
                     self.s.segment.loc_far = True
@@ -269,13 +301,16 @@ class TripManager:
             ref_lat = t.last_lat if t.last_lat is not None else (prev.lat if prev else lat)
             ref_lon = t.last_lon if t.last_lon is not None else (prev.lon if prev else lon)
             moved = haversine_m(ref_lat, ref_lon, lat, lon) > MOVE_THRESHOLD_M
-            if self.s.segment and self.s.segment.off is None and self.s.segment.loc_at_on:
-                if haversine_m(*self.s.segment.loc_at_on, lat, lon) > self.settings.trip_start_distance_m:
-                    self.s.segment.loc_far = True
+            seg = self.s.segment
+            if seg and seg.off is None:
+                if moved:
+                    seg.moved = True
+                if seg.loc_at_on and haversine_m(*seg.loc_at_on, lat, lon) > self.settings.trip_start_distance_m:
+                    seg.loc_far = True
             self._trip_point(lat, lon, ts, moved=moved, prev=(ref_lat, ref_lon))
         return True
 
-    def _on_odometer(self, state: str, ts: str) -> bool:
+    def _on_odometer(self, state: str, ts: str, attrs: dict | None = None) -> bool:
         value = _float(state)
         if value is None or value == self.s.odometer:
             return False
@@ -297,6 +332,15 @@ class TripManager:
             return True
         t = self.s.trip
         if t is not None:
+            increased = prev is not None and value > prev
+            if increased and seg and seg.ghost and seg.off and _secs(seg.off, ts) <= LATE_DATA_WINDOW_S:
+                # haamuksi tulkittu jakso olikin ajoa: mittari kasvoi heti sen jälkeen
+                seg.ghost = False
+                t.stop_time = seg.off
+                t.end_hint = None
+                self.ignored_ghosts = max(0, self.ignored_ghosts - 1)
+            if increased:
+                self._end_hint(ts, (attrs or {}).get("timestamp"))
             if t.end_odometer is None or value > t.end_odometer:
                 t.end_odometer = value
                 if prev is not None and value > prev:
@@ -322,14 +366,19 @@ class TripManager:
             return True
         seg.off = ts
         duration = (timeutil.parse_iso(ts) - timeutil.parse_iso(seg.on)).total_seconds()
-        real = seg.odo_increased or seg.loc_far or duration >= self.settings.ghost_motion_max_s
+        evidence = seg.odo_increased or seg.loc_far or seg.moved
         t = self.s.trip
         if t is not None and self.s.state in (DRIVING, PAUSED_CHARGING):
+            # Pitkäkin on-jakso ilman siirtymää on haamu, jos ajolla on jo pysähdys
+            # (530e: off -> 30 s -> on 7 min -> off pysäköinnin jälkeen).
+            real = evidence or (duration >= self.settings.ghost_motion_max_s and t.stop_time is None)
             if real:
                 t.stop_time = ts
+                t.end_hint = None
                 if self.s.state == PAUSED_CHARGING and (seg.odo_increased or seg.loc_far):
                     self._resume(seg.on)
             else:
+                seg.ghost = True
                 self.ignored_ghosts += 1
                 _LOG.info("%s: haamuliike ohitettu (%.0f s, ei siirtymää)", self.vehicle.id, duration)
         elif not (seg.odo_increased or seg.loc_far):
@@ -356,6 +405,7 @@ class TripManager:
             self.s.parked_odometer = odometer
         self.s.parked_soc = self.s.soc
         self.s.parked_since = ts
+        self.s.first_move_ts = None
 
     def _start_trip(self, ts: str, reason: str) -> None:
         seg = self.s.segment
@@ -367,6 +417,13 @@ class TripManager:
             ).total_seconds() <= self.settings.trip_end_timeout_s
             if recent and (self.s.parked_since is None or seg.on >= self.s.parked_since):
                 start = min(seg.on, ts)
+        fm = self.s.first_move_ts
+        if (
+            fm is not None
+            and (self.s.parked_since is None or fm >= self.s.parked_since)
+            and 0 <= _secs(fm, ts) <= self.settings.trip_end_timeout_s
+        ):
+            start = min(start, fm)  # auto lähti liikkeelle jo ennen kuin siirtymä ylitti rajan
         start_odo = self.s.parked_odometer if self.s.parked_odometer is not None else self.s.odometer
         self.s.trip = ActiveTrip(
             start_time=start,
@@ -381,6 +438,7 @@ class TripManager:
             last_movement_time=ts,
             stop_time=seg.off if (seg and seg.off and seg.off >= start) else None,
         )
+        self.s.first_move_ts = None
         self.s.state = DRIVING
         _LOG.info("%s: ajo alkoi %s (%s)", self.vehicle.id, start, reason)
 
@@ -393,6 +451,8 @@ class TripManager:
         elif prev is None and t.start_lat is not None:
             t.path_m += haversine_m(t.start_lat, t.start_lon, lat, lon)
         t.last_lat, t.last_lon = lat, lon
+        if moved or prev is None:
+            t.last_moved_time = ts
         if moved:
             self._movement(ts)
 
@@ -426,6 +486,7 @@ class TripManager:
         if self.has_motion and t.stop_time is not None:
             # liikettä ilman liiketilaa (liiketieto puuttui): ajo jatkuu
             t.stop_time = None
+            t.end_hint = None
 
     def _resume(self, ts: str) -> None:
         t = self.s.trip
@@ -439,8 +500,25 @@ class TripManager:
             t.charging_stops.append(stop)
             t.current_stop = None
         t.stop_time = None
+        t.end_hint = None
         self.s.state = DRIVING
         _LOG.info("%s: ajo jatkuu lataustauon jälkeen", self.vehicle.id)
+
+    def _end_hint(self, ts: str, stamp: Any) -> None:
+        """Mittarilukeman oma aikaleima kertoo todellisen pysähdyshetken, kun liiketilan
+        off tuli myöhässä. Käytetään vain, jos se osuu viimeisen siirtymän ja off-hetken väliin."""
+        t = self.s.trip
+        if t is None or not stamp or t.stop_time is None or self.s.motion:
+            return
+        if _secs(t.stop_time, ts) > LATE_DATA_WINDOW_S or ts < t.stop_time:
+            return
+        try:
+            hint = timeutil.to_iso(timeutil.parse_iso(str(stamp)))
+        except Exception:
+            return
+        lower = max(t.start_time, t.last_moved_time or t.start_time)
+        if lower <= hint <= t.stop_time and _secs(hint, t.stop_time) <= MAX_END_HINT_S:
+            t.end_hint = hint
 
     def _stop_reference(self) -> str | None:
         """Hetki, jolloin auto pysähtyi, tai None jos auto on yhä liikkeessä."""
@@ -464,6 +542,10 @@ class TripManager:
             return False
         if self.in_home_zone(t.last_lat, t.last_lon):
             return False
+        if None not in (t.start_lat, t.start_lon, t.last_lat, t.last_lon) and haversine_m(
+            t.start_lat, t.start_lon, t.last_lat, t.last_lon
+        ) <= 2 * self.settings.trip_start_distance_m:
+            return False  # lataus lähtöpaikalla (esim. kotona ilman kotivyöhykettä) päättää ajon
         is_dc = "DC" in (self.s.charging_method or "").upper()
         return is_dc or (self.vehicle.charging_pause_enabled and self.vehicle.charging_pause_timeout_s > 0)
 
@@ -506,8 +588,11 @@ class TripManager:
             timeout = self.settings.trip_end_timeout_s
         if idle_s < timeout:
             return None
-        trip = self._finish(ref)
-        _LOG.info("%s: ajo päättyi %s (%s)", self.vehicle.id, ref, now_iso)
+        end = ref
+        if t.end_hint and ref == t.stop_time and t.start_time <= t.end_hint <= ref:
+            end = t.end_hint
+        trip = self._finish(end)
+        _LOG.info("%s: ajo päättyi %s (%s)", self.vehicle.id, end, now_iso)
         self.save()
         return trip
 
@@ -559,6 +644,11 @@ class TripManager:
         if self.on_trip_finished:
             self.on_trip_finished(trip)
         return trip
+
+
+def _secs(a: str, b: str) -> float:
+    """Sekunnit ISO-aikaleimasta a aikaleimaan b."""
+    return (timeutil.parse_iso(b) - timeutil.parse_iso(a)).total_seconds()
 
 
 def _float(value: Any) -> float | None:

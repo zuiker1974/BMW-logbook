@@ -164,3 +164,14 @@ def test_unavailable_states_are_ignored():
     sim.at(150).loc(None, None)
     assert sim.tm.s.odometer == 10000
     assert sim.tm.state == IDLE
+
+
+def test_charging_at_trip_start_ends_trip_without_home_zone():
+    sim = parked_at_home(Sim(zones=[]))
+    e1 = drive(sim, 600, HOME, WORK, 10, 10000, 8)
+    e2 = drive(sim, e1 + 120, WORK, HOME, 10, 10008, 8)  # käynti kääntymässä, takaisin lähtöpaikalle
+    sim.at(e2 + 30).ev("charging_method", "AC").ev("charging_state", "CHARGINGACTIVE")
+    sim.tick(e2 + 200)
+    assert sim.tm.state == DRIVING
+    sim.tick(e2 + 601)
+    assert sim.tm.state == IDLE and len(sim.trips) == 1
