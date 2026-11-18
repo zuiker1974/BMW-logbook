@@ -1,5 +1,5 @@
 name: BMW-ajopäiväkirja
-version: "0.1.0"
+version: "0.1.1"
 slug: bmw_logbook
 description: Automaattinen ajopäiväkirja BMW-autoille Home Assistantin CarData-datasta (530e, iX3)
 url: https://github.com/zuiker1974/bmw-logbook
