@@ -1,5 +1,5 @@
 name: BMW-ajopäiväkirja
-version: "0.1.1"
+version: "0.2.0"
 slug: bmw_logbook
 description: Automaattinen ajopäiväkirja BMW-autoille Home Assistantin CarData-datasta (530e, iX3)
 url: https://github.com/zuiker1974/bmw-logbook
@@ -34,6 +34,9 @@ options:
       entity_charging_state: sensor.charging_ev_charging_state
       entity_charging_method: sensor.charging_ev_charging_method
       entity_hv_system_state: sensor.charging_ev_hv_system_state
+      entity_fuel_level: sensor.530e_xdrive_range_tank_level
+      entity_charger_energy: sensor.abb_energy_delivered
+      charge_kwh_per_pct: 0.12
     - id: ix3
       plate: ""
       make: BMW
@@ -51,6 +54,9 @@ options:
       entity_charging_state: ""
       entity_charging_method: ""
       entity_hv_system_state: ""
+      entity_fuel_level: ""
+      entity_charger_energy: ""
+      charge_kwh_per_pct: 0.8
   export_dir: /share/ajopaivakirja
   month_folder_format: "%m"
   trip_start_distance_m: 100
@@ -70,6 +76,7 @@ options:
   archive_filtered:
     - business
   nominatim_user_agent: bmw-logbook-fi/0.1
+  refuel_min_l: 3
   log_level: info
 schema:
   vehicles:
@@ -90,6 +97,9 @@ schema:
       entity_charging_state: str?
       entity_charging_method: str?
       entity_hv_system_state: str?
+      entity_fuel_level: str?
+      entity_charger_energy: str?
+      charge_kwh_per_pct: float(0,5)?
   export_dir: str
   month_folder_format: str
   trip_start_distance_m: int(10,5000)
@@ -109,4 +119,5 @@ schema:
   archive_filtered:
     - list(business|private|commute)
   nominatim_user_agent: str
+  refuel_min_l: float(1,30)?
   log_level: list(debug|info|warning|error)

@@ -11,7 +11,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import timeutil
 from .database import TRIP_TYPE_BY_LABEL, TRIP_TYPE_LABELS, LogbookError, VehicleDB
-from .report_data import APP_VERSION, MONTH_NAMES, ReportContext, ReportFilter
+from .report_data import APP_VERSION, MONTH_NAMES, ReportContext, ReportFilter, consumption_row
 
 FORMAT_VERSION = "1"
 HEADERS = [
@@ -41,6 +41,25 @@ BACKUP_NOTE = (
     "selainnäkymässä (Raportit → Tuo Excel). Drivessa olevaa tiedostoa ei kannata muokata paikallaan, "
     "koska seuraava varmuuskopio ylikirjoittaa sen."
 )
+
+CONS_HEADERS = [
+    "Päivämäärä",
+    "Aika",
+    "Tapahtuma",
+    "Paikka",
+    "Määrä",
+    "Yksikkö",
+    "Varaus / tankki",
+    "Lähde",
+    "Yksikköhinta",
+    "Hinnan yksikkö",
+    "Kommentti",
+    "Kulu-ID",
+]
+CONS_WIDTHS = [11, 12, 10, 36, 9, 8, 16, 20, 12, 10, 36, 8]
+CONS_EDITABLE = ("Yksikköhinta", "Kommentti")
+CONS_SHEET = "Kulut"
+CONS_META = "_meta_kulut"
 
 BOLD = Font(bold=True)
 HEAD_FILL = PatternFill("solid", fgColor="E2E8F0")
@@ -210,6 +229,9 @@ def build_xlsx(ctx: ReportContext, year: int, flt: ReportFilter | None = None) -
             tws.cell(row=row, column=8, value=round(year_total, 1)).font = BOLD
             _protect(tws)
 
+    if not flt.is_partial:
+        _consumption_sheets(wb, ctx, year, locked_months)
+
     meta = wb.create_sheet("_meta")
     kv = [
         ("format_version", FORMAT_VERSION),
@@ -239,6 +261,146 @@ def build_xlsx(ctx: ReportContext, year: int, flt: ReportFilter | None = None) -
     return buf.getvalue()
 
 
+def _consumption_sheets(wb, ctx: ReportContext, year: int, locked_months: set) -> None:
+    ys, ye = timeutil.year_bounds(year)
+    rows = [consumption_row(e) for e in ctx.db.list_consumption(ys, ye)]
+    ws = wb.create_sheet(CONS_SHEET)
+    ws.cell(row=1, column=1, value=f"Kulut {year} – {ctx.vehicle.id} {ctx.vehicle.plate} (määrät)").font = TITLE_FONT
+    ws.cell(
+        row=2,
+        column=1,
+        value="Muokattavat sarakkeet: Yksikköhinta (vapaaehtoinen, esim. 0,12 tai 1,89) ja Kommentti (keltainen otsikko). "
+        "Euromääriä ei lasketa.",
+    )
+    for i, h in enumerate(CONS_HEADERS, start=1):
+        c = ws.cell(row=HEADER_ROW, column=i, value=h)
+        c.font = BOLD
+        c.fill = EDIT_FILL if h in CONS_EDITABLE else HEAD_FILL
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.column_dimensions[get_column_letter(i)].width = CONS_WIDTHS[i - 1]
+    ws.column_dimensions[get_column_letter(len(CONS_HEADERS))].hidden = True
+    ws.freeze_panes = ws.cell(row=FIRST_ROW, column=1)
+    meta = wb.create_sheet(CONS_META)
+    meta.append(["event_id", "unit_price", "comment"])
+    for i, r in enumerate(rows):
+        row = FIRST_ROW + i
+        t = r["start"] + (f"–{r['end']}" if r["end"] and r["end"] != r["start"] else "")
+        values = [
+            r["date"],
+            t,
+            r["kind_label"],
+            r["place"],
+            r["quantity"],
+            r["unit"],
+            r["level"],
+            r["source_label"] + (f" ({'; '.join(r['markers'])})" if r["markers"] else ""),
+            r["unit_price"],
+            r["unit_price_label"],
+            r["comment"],
+            r["id"],
+        ]
+        for col, value in enumerate(values, start=1):
+            c = ws.cell(row=row, column=col, value=value)
+            c.alignment = Alignment(wrap_text=col in (4, 8, 11), vertical="top")
+            if CONS_HEADERS[col - 1] in CONS_EDITABLE:
+                c.protection = Protection(locked=False)
+            if CONS_HEADERS[col - 1] == "Yksikköhinta":
+                c.number_format = "0.00##"
+        meta.append([r["id"], r["unit_price"], r["comment"]])
+    if not rows:
+        ws.cell(row=FIRST_ROW, column=1, value="Ei latauksia tai tankkauksia tänä vuonna.")
+    # kuukausittaiset määrät
+    sr = FIRST_ROW + max(len(rows), 1) + 2
+    ws.cell(row=sr, column=1, value="Kuukausittain").font = BOLD
+    head = ["Kuukausi", "Ladattu kWh", "josta arvio kWh"] + (["Tankattu l", "Kulunut l (tankin lukema)"] if ctx.vehicle.has_fuel else [])
+    for i, h in enumerate(head, start=1):
+        c = ws.cell(row=sr + 1, column=i, value=h)
+        c.font = BOLD
+        c.fill = HEAD_FILL
+        c.alignment = Alignment(wrap_text=True)
+    for m in range(1, 13):
+        ms, me = timeutil.month_bounds(year, m)
+        c = ctx.consumption_summary(ms, me)
+        vals = [MONTH_NAMES[m], c["charged_kwh"], c["charged_estimated_kwh"]]
+        if ctx.vehicle.has_fuel:
+            vals += [c["refuelled_l"], c["fuel_used_l"]]
+        for i, v in enumerate(vals, start=1):
+            ws.cell(row=sr + 1 + m, column=i, value=v)
+    tr = sr + 14
+    ws.cell(row=tr, column=1, value="Yhteensä").font = BOLD
+    for i in range(2, len(head) + 1):
+        col = get_column_letter(i)
+        ws.cell(row=tr, column=i, value=f"=SUM({col}{sr + 2}:{col}{sr + 13})").font = BOLD
+    _protect(ws)
+    meta.sheet_state = "hidden"
+    _protect(meta)
+
+
+def _import_consumption(db: VehicleDB, wb, res: "ImportResult", source: str, filename: str) -> None:
+    if CONS_SHEET not in wb.sheetnames:
+        return
+    exported: dict[int, dict] = {}
+    if CONS_META in wb.sheetnames:
+        for row in wb[CONS_META].iter_rows(min_row=2, values_only=True):
+            if row and row[0] is not None:
+                try:
+                    exported[int(row[0])] = {"unit_price": row[1], "comment": _norm(row[2])}
+                except (TypeError, ValueError):
+                    continue
+    ws = wb[CONS_SHEET]
+    cols: dict[str, int] = {}
+    header_row = None
+    for r in range(1, 10):
+        values = [ws.cell(row=r, column=c).value for c in range(1, len(CONS_HEADERS) + 3)]
+        if "Kulu-ID" in values:
+            header_row = r
+            cols = {str(v): i + 1 for i, v in enumerate(values) if v}
+            break
+    if header_row is None:
+        return
+    for r in range(header_row + 1, ws.max_row + 1):
+        raw_id = ws.cell(row=r, column=cols["Kulu-ID"]).value
+        if raw_id in (None, ""):
+            continue
+        try:
+            eid = int(_num(raw_id))
+        except (TypeError, ValueError):
+            continue
+        ev = db.get_consumption(eid)
+        exp = exported.get(eid)
+        if ev is None or exp is None:
+            res.unknown_rows.append(f"Kulut rivi {r}: Kulu-ID {eid} ei kuulu tämän auton kirjanpitoon")
+            continue
+        get = lambda h: ws.cell(row=r, column=cols[h]).value if h in cols else None  # noqa: E731
+        # yksikköhinta
+        xv = get("Yksikköhinta")
+        xnum = _num(xv)
+        if isinstance(xnum, str):
+            res.skipped.append(f"Kulu {eid}: yksikköhinta '{xv}' ei ole luku")
+        elif _num(exp["unit_price"]) != xnum:
+            if _num(ev["unit_price"]) not in (_num(exp["unit_price"]), xnum):
+                res.conflicts.append(f"Kulu {eid}: yksikköhinta muuttunut sekä selaimessa että Excelissä, Excelin arvoa ei tuotu")
+            else:
+                try:
+                    db.update_consumption(eid, "unit_price", xnum, source=source, reason=f"Excel-tuonti {filename}")
+                    res.applied.append(f"Kulu {eid}: yksikköhinta päivitetty")
+                    res.changed_consumption_ids.add(eid)
+                except LogbookError as exc:
+                    res.skipped.append(f"Kulu {eid}: {exc}")
+        # kommentti
+        xc = _norm(get("Kommentti"))
+        if xc != exp["comment"]:
+            current = ev["comment"] or ""
+            new = xc
+            if current != exp["comment"] and current != xc:
+                new = " | ".join(x for x in (current, xc) if x)
+                res.conflicts.append(f"Kulu {eid}: kommentti muuttunut sekä selaimessa että Excelissä, tekstit yhdistetty")
+            if new != current:
+                db.update_consumption(eid, "comment", new, source=source, reason=f"Excel-tuonti {filename}")
+                res.applied.append(f"Kulu {eid}: kommentti päivitetty")
+                res.changed_consumption_ids.add(eid)
+
+
 # ---------------------------------------------------------------------- tuonti
 class ImportRejected(LogbookError):
     pass
@@ -254,6 +416,7 @@ class ImportResult:
     locked_changes: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     changed_trip_ids: set = field(default_factory=set)
+    changed_consumption_ids: set = field(default_factory=set)
 
     @property
     def changed_rows(self) -> int:
@@ -271,6 +434,8 @@ class ImportResult:
 
     def status_text(self) -> str:
         parts = [f"{self.changed_rows} matkaa päivitetty"]
+        if self.changed_consumption_ids:
+            parts.append(f"{len(self.changed_consumption_ids)} kulua päivitetty")
         if self.conflicts:
             parts.append(f"{len(self.conflicts)} ristiriitaa")
         if self.unknown_rows:
@@ -402,6 +567,7 @@ def import_xlsx(
                 if not same:
                     res.locked_changes.append(f"Matka {tid}: '{header}' muutettu Excelissä ({_norm(mv)} → {_norm(xv)}), ei tuotu")
             _import_trip(db, res, tid, trip, meta, get, source, filename)
+    _import_consumption(db, wb, res, source, filename)
     status = "ok"
     if res.conflicts:
         status = "conflicts"

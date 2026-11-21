@@ -55,6 +55,9 @@ Jokaisella autolla on oma kohta `vehicles`-listassa:
 | `entity_location`, `entity_odometer` | **Pakolliset**: sijainti (device_tracker) ja matkamittari. |
 | `entity_motion` | Suositeltu: liiketila (binary_sensor). |
 | `entity_soc`, `entity_charging_state`, `entity_charging_method`, `entity_hv_system_state` | Valinnaiset: akun varaus ja lataustiedot. |
+| `entity_fuel_level` | Kululaskenta, vain PHEV: tankin polttoainemäärä litroina. |
+| `entity_charger_energy` | Kululaskenta: kotilaturin istuntokohtainen energia (Wh tai kWh), joka nollautuu kaapelin irrotuksessa. |
+| `charge_kwh_per_pct` | Kululaskenta: kWh per varausprosentti, jolla muualla kuin kotona ladattu energia arvioidaan (530e 0,12, iX3 noin 0,8). 0 = ei arviota. |
 
 530e:n entiteetit on valmiiksi täytetty (tarkistettu HA:sta 17.11.2026):
 
@@ -66,7 +69,14 @@ entity_soc: sensor.530e_xdrive_battery_ev_state_of_charge
 entity_charging_state: sensor.charging_ev_charging_state
 entity_charging_method: sensor.charging_ev_charging_method
 entity_hv_system_state: sensor.charging_ev_hv_system_state
+entity_fuel_level: sensor.530e_xdrive_range_tank_level
+entity_charger_energy: sensor.abb_energy_delivered
+charge_kwh_per_pct: 0.12
 ```
+
+**Päivitys 0.1.x → 0.2.0:** jos 530e:n asetukset on tallennettu jo aiemmin, lisää kolme viimeistä riviä
+530e:n kohtaan itse (lisäosan päivitys ei muuta tallennettuja asetuksia). Ilman niitä kululaskenta
+toimii vain arviona varaustasosta, eikä tankkauksia kirjata.
 
 Älä nimeä 530e:n entiteettejä uudelleen: latausautomaatiot riippuvat niistä.
 
@@ -79,7 +89,9 @@ iX3 on asetuksissa valmiina, mutta pois päältä (`enabled: false`).
    lataustila ja latausmenetelmä). **Älä arvaa nimiä:** latausentiteeteissä ei ole auton nimeä, joten
    iX3:n vastaavat saavat todennäköisesti päätteen `_2` (esim. `sensor.charging_ev_charging_state_2`).
    Varmista jokainen laitesivulta.
-3. Täytä ne iX3:n kohtaan, lisää rekisteritunnus ja VIN, ja vaihda `enabled: true`.
+3. Täytä ne iX3:n kohtaan, lisää rekisteritunnus ja VIN, ja vaihda `enabled: true`. Jos iX3 ladataan
+   samalla ABB-laturilla, aseta sille myös `entity_charger_energy: sensor.abb_energy_delivered`.
+   Laturin energia kirjataan sille autolle, joka on kytketty, joten autot pysyvät erillään.
 4. Käynnistä lisäosa uudelleen ja tarkista ajopäiväkirjan Asetukset-sivulta, että kaikissa on ✓.
 
 Jos pakollinen entiteetti puuttuu, auto näkyy tilassa *Ei konfiguroitu*, eikä se vaikuta toisen auton
@@ -101,6 +113,7 @@ kirjaukseen.
 | `archive_filtered` | `[business]` | Lukittaessa arkistoidaan myös työajojen osaraportti. |
 | `month_folder_format` | `%m` | Kuukausikansion nimi (`11`). |
 | `report_xlsx`, `report_csv` | true, false | Kirjoitetaanko Excel ja CSV raporttikansioon. |
+| `refuel_min_l` | 3 | Tankin litramäärän nousu, joka kirjataan tankkaukseksi. |
 
 ## 3. Käyttö
 
@@ -114,7 +127,27 @@ näkymänsä (`/v/530e`, `/v/ix3`). Kaikkien autojen yhteistä näkymää ei ole
   näkyy varoitusrivi. Siitä voi lisätä puuttuvan ajon tai kuitata aukon perustellusti.
 - **Korjaukset:** matkan *tiedot*-sivulla voi korjata paikan, ajan tai mittarilukeman. Korjaus vaatii
   perustelun, alkuperäinen arvo säilyy ja muutos näkyy muutoshistoriassa ja raportissa.
+- **Kulut:** auton lataukset ja tankkaukset (vain määrät) sekä kuukauden summat. Yksikköhinnan
+  (€/kWh tai €/l) voi lisätä riville, mutta se ei ole pakollinen, eikä euromääriä lasketa. Väärin
+  tunnistetun rivin määrän voi korjata tai poistaa laskennasta perustellusti, ja puuttuvan latauksen
+  (esim. julkinen laturi) voi lisätä käsin.
 - **Raportit ja lukitus:** lataa PDF tai Excel selaimella, tuo kommentoitu Excel ja lukitse kuukausi.
+
+### Kululaskenta
+
+- **Lataus:** kytkentä alkaa, kun auton latausmenetelmä vaihtuu (esim. `AC_TYPE2PLUG`), ja päättyy, kun se
+  palaa tilaan `NOCHARGING` tai auto lähtee liikkeelle. Kotona määrä on laturin oman mittarin istuntolukema
+  (energia seinästä, sisältää lataushäviöt). BMW ilmoittaa kytkennän joskus jopa 40 min myöhässä, joten
+  laturin juuri ennen kytkentätietoa alkanut istunto lasketaan mukaan. Muualla ladattu energia arvioidaan
+  varaustason noususta (`charge_kwh_per_pct`), ja rivi merkitään arvioksi.
+- **Tankkaus (530e):** tankin litramäärän nousu vähintään `refuel_min_l` litraa. Auto ilmoittaa vain
+  kokonaisia litroja, joten tarkkuus on noin ±1 l. Aika ja paikka ovat se hetki, jolloin auto ilmoitti
+  nousun.
+- **Kulunut polttoaine** on kuukauden aikana tankin lukemien laskujen summa.
+- Kuukausi-PDF:ssä on Kulut-osio, vuosi-PDF:ssä kuukausittainen yhteenveto ja Excelissä Kulut-välilehti,
+  jossa Yksikköhinta ja Kommentti ovat muokattavia ja tuodaan takaisin Kulu-ID:n perusteella.
+  Ajotyyppikohtaisissa osaraporteissa kuluja ei näytetä, koska niitä ei voi jakaa ajoille.
+- Lukitulla jaksolla määrää ei voi muuttaa, mutta yksikköhinnan ja kommentin voi lisätä.
 
 ### Lukitus
 
@@ -220,7 +253,8 @@ Raportit päivittyvät noin 5 minuutin kuluttua matkan päättymisestä tai muut
 
 Jos MQTT on käytössä, jokaiselle autolle luodaan oma laite (*BMW-ajopäiväkirja 530e*, *BMW-ajopäiväkirja ix3*)
 ja sensorit `sensor.bmw_logbook_<auto>_status`, `_last_trip_distance`, `_last_trip_route`,
-`_month_business_km`, `_month_private_km`, `_last_export` ja `_last_import`. Nämä ovat uusia entiteettejä
+`_month_business_km`, `_month_private_km`, `_month_charged_kwh`, `_last_export` ja `_last_import`
+(PHEV:lle myös `_month_refuelled_l` ja `_month_fuel_used_l`). Nämä ovat uusia entiteettejä
 eivätkä muuta olemassa olevia.
 
 ## 7. Miten ajot tunnistetaan

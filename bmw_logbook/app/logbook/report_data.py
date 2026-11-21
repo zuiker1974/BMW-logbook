@@ -4,11 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import timeutil
-from .database import CORRECTION_FIELDS, TRIP_TYPE_LABELS, VehicleDB
+from .database import CONSUMPTION_KINDS, CONSUMPTION_SOURCES, CORRECTION_FIELDS, TRIP_TYPE_LABELS, VehicleDB
 from .integrity import odometer_issues, odometer_reconciliation, summarize
 from .vehicle_registry import Settings, VehicleConfig
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 MONTH_NAMES = [
     "",
@@ -152,6 +152,13 @@ class ReportContext:
             s["months"].append(sm)
         return s
 
+    # ----------------------------------------------------------------- kulut
+    def consumption_rows(self, start_iso: str, end_iso: str) -> list[dict]:
+        return [consumption_row(e) for e in self.db.list_consumption(start_iso, end_iso)]
+
+    def consumption_summary(self, start_iso: str, end_iso: str, total_km: float | None = None) -> dict:
+        return consumption_summary(self.db, self.vehicle, start_iso, end_iso, total_km)
+
     def drivers(self, trips: list[dict]) -> list[str]:
         names = []
         for t in trips:
@@ -226,3 +233,103 @@ def fmt_km(v) -> str:
         return ""
     v = float(v)
     return f"{v:,.0f}".replace(",", " ") if v.is_integer() else f"{v:,.1f}".replace(",", " ").replace(".", ",")
+
+
+# ---------------------------------------------------------------------- kulut
+def fmt_qty(v, decimals: int = 2) -> str:
+    if v is None:
+        return ""
+    return f"{float(v):,.{decimals}f}".replace(",", " ").replace(".", ",")
+
+
+def fmt_price(v) -> str:
+    if v is None:
+        return ""
+    whole, frac = f"{float(v):.4f}".split(".")
+    frac = frac.rstrip("0").ljust(2, "0")
+    return f"{whole},{frac}"
+
+
+def consumption_row(e: dict) -> dict:
+    is_charge = e["kind"] == "charge"
+    if is_charge:
+        level = ""
+        if e["soc_start"] is not None and e["soc_end"] is not None:
+            level = f"{e['soc_start']:.0f} → {e['soc_end']:.0f} %"
+    else:
+        level = ""
+        if e["fuel_before"] is not None and e["fuel_after"] is not None:
+            level = f"{e['fuel_before']:.0f} → {e['fuel_after']:.0f} l"
+    markers = []
+    if e["corrected"]:
+        markers.append(f"korjattu, alkuperäinen {fmt_qty(e['orig_quantity'])} {e['unit']}")
+    unit_price_label = "€/kWh" if is_charge else "€/l"
+    return {
+        "id": e["id"],
+        "kind": e["kind"],
+        "kind_label": CONSUMPTION_KINDS[e["kind"]],
+        "date": timeutil.fmt_date(e["start_time"]),
+        "start": timeutil.fmt_time(e["start_time"]),
+        "end": timeutil.fmt_time(e["end_time"]) if e["end_time"] else "",
+        "end_date": timeutil.fmt_date(e["end_time"]) if e["end_time"] else "",
+        "place": place(e["address"], e["lat"], e["lon"]) or ("koti" if e["at_home"] else ""),
+        "at_home": bool(e["at_home"]),
+        "quantity": e["quantity"],
+        "quantity_text": fmt_qty(e["quantity"], 2 if is_charge else 1),
+        "unit": e["unit"],
+        "source": e["source"],
+        "source_label": CONSUMPTION_SOURCES[e["source"]],
+        "level": level,
+        "method": e["method"] or "",
+        "unit_price": e["unit_price"],
+        "unit_price_text": fmt_price(e["unit_price"]),
+        "unit_price_label": unit_price_label,
+        "comment": e["comment"] or "",
+        "markers": markers,
+        "voided": bool(e["voided"]),
+        "start_time": e["start_time"],
+    }
+
+
+def fuel_used(db: VehicleDB, start_iso: str, end_iso: str) -> tuple[float | None, float | None, float | None]:
+    """Jakson aikana tankista kulunut polttoaine (summa lukemien laskuista).
+
+    Palauttaa (kulunut, lukema jakson alussa, lukema jakson lopussa)."""
+    readings = db.fuel_readings(start_iso, end_iso)
+    before = db.fuel_reading_before(start_iso)
+    series = ([before] if before else []) + readings
+    if not series:
+        return None, None, None
+    used = 0.0
+    for a, b in zip(series, series[1:]):
+        if b["litres"] < a["litres"]:
+            used += a["litres"] - b["litres"]
+    return round(used, 1), series[0]["litres"], series[-1]["litres"]
+
+
+def consumption_summary(db: VehicleDB, vehicle: VehicleConfig, start_iso: str, end_iso: str, total_km: float | None = None) -> dict:
+    events = db.list_consumption(start_iso, end_iso)
+    charges = [e for e in events if e["kind"] == "charge"]
+    refuels = [e for e in events if e["kind"] == "refuel"]
+    measured = sum(e["quantity"] for e in charges if e["source"] in ("charger", "manual"))
+    estimated = sum(e["quantity"] for e in charges if e["source"] == "estimate")
+    s = {
+        "charge_count": len(charges),
+        "charged_kwh": round(measured + estimated, 2),
+        "charged_measured_kwh": round(measured, 2),
+        "charged_estimated_kwh": round(estimated, 2),
+        "has_fuel": vehicle.has_fuel,
+        "refuel_count": len(refuels),
+        "refuelled_l": round(sum(e["quantity"] for e in refuels), 1),
+        "fuel_used_l": None,
+        "fuel_start_l": None,
+        "fuel_end_l": None,
+        "fuel_per_100km": None,
+        "total_km": total_km,
+    }
+    if vehicle.has_fuel:
+        used, first, last = fuel_used(db, start_iso, end_iso)
+        s.update(fuel_used_l=used, fuel_start_l=first, fuel_end_l=last)
+        if used is not None and total_km:
+            s["fuel_per_100km"] = round(used / total_km * 100, 1)
+    return s

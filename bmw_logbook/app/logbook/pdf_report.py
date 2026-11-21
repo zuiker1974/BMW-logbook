@@ -25,7 +25,7 @@ from reportlab.platypus import (
 from . import timeutil
 from .database import CORRECTION_FIELDS
 from .integrity import summarize
-from .report_data import APP_VERSION, MONTH_NAMES, ReportContext, ReportFilter, fmt_km
+from .report_data import APP_VERSION, MONTH_NAMES, ReportContext, ReportFilter, fmt_km, fmt_qty
 
 _FONT = "Helvetica"
 _FONT_BOLD = "Helvetica-Bold"
@@ -254,7 +254,92 @@ def build_month_pdf(
     else:
         story.append(P("Ei ajoja tällä jaksolla.", S_BODY))
     story += [Spacer(1, 3 * mm), _legend()]
+    if not flt.is_partial:
+        story += _consumption_section(ctx, start, end, summary.get("total_km"))
     return _render(ctx, story, f"{month:02d}/{year}", footer_note)
+
+
+CONSUMPTION_HEADERS = ["Pvm", "Aika", "Tapahtuma", "Paikka", "Määrä", "Varaus / tankki", "Lähde", "Yksikköhinta", "Kommentti"]
+CONSUMPTION_COL_W = [17, 20, 18, 64, 20, 26, 30, 20, 58]
+
+
+def _consumption_lines(c: dict) -> list[tuple[str, str]]:
+    lines = []
+    charged = f"{fmt_qty(c['charged_kwh'])} kWh ({c['charge_count']} kpl)"
+    if c["charged_estimated_kwh"]:
+        charged += f", josta arvioitu {fmt_qty(c['charged_estimated_kwh'])} kWh"
+    lines.append(("Ladattu sähköä", charged))
+    if c["has_fuel"]:
+        lines.append(("Tankattu polttoainetta", f"{fmt_qty(c['refuelled_l'], 1)} l ({c['refuel_count']} kpl)"))
+        if c["fuel_used_l"] is not None:
+            used = f"{fmt_qty(c['fuel_used_l'], 1)} l"
+            if c["fuel_start_l"] is not None and c["fuel_end_l"] is not None:
+                used += f" (tankissa {fmt_qty(c['fuel_start_l'], 0)} l → {fmt_qty(c['fuel_end_l'], 0)} l)"
+            if c["fuel_per_100km"] is not None:
+                used += f", {fmt_qty(c['fuel_per_100km'], 1)} l/100 km"
+            lines.append(("Polttoainetta kulunut", used))
+    return lines
+
+
+def _consumption_section(ctx: ReportContext, start: str, end: str, total_km: float | None) -> list:
+    rows = ctx.consumption_rows(start, end)
+    c = ctx.consumption_summary(start, end, total_km)
+    if not rows and c.get("fuel_used_l") in (None, 0):
+        return []
+    out = [Spacer(1, 4 * mm), P("Kulut (määrät)", S_H2)]
+    summary = [[P(a, S_CELL_B), P(b)] for a, b in _consumption_lines(c)]
+    st = Table(summary, colWidths=[52 * mm, 150 * mm])
+    st.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#cbd5e1")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f1f5f9")),
+            ]
+        )
+    )
+    out += [st, Spacer(1, 2 * mm)]
+    if rows:
+        data = [[P(h, S_CELL_B) for h in CONSUMPTION_HEADERS]]
+        for r in rows:
+            t = r["start"] + (f"–{r['end']}" if r["end"] and r["end"] != r["start"] else "")
+            if r["end_date"] and r["end_date"] != r["date"]:
+                t += f"\n(päättyi {r['end_date'][:6]})"
+            price = f"{r['unit_price_text']} {r['unit_price_label']}" if r["unit_price_text"] else ""
+            comment = "\n".join([x for x in [r["comment"]] + [f"[{m}]" for m in r["markers"]] if x])
+            data.append(
+                [
+                    P(r["date"]),
+                    P(t),
+                    P(r["kind_label"]),
+                    P(r["place"]),
+                    P(f"{r['quantity_text']} {r['unit']}", S_CELL_R),
+                    P(r["level"]),
+                    P(r["source_label"]),
+                    P(price, S_CELL_R),
+                    P(comment),
+                ]
+            )
+        t = Table(data, colWidths=[w * mm for w in CONSUMPTION_COL_W], repeatRows=1)
+        style = [
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ]
+        t.setStyle(TableStyle(style))
+        out.append(t)
+    out += [
+        Spacer(1, 2 * mm),
+        P(
+            "Määrät luetaan Home Assistantista: kotilatauksen energia laturin omasta mittarista (seinästä, sisältää "
+            "lataushäviöt), muualla ladattu arvioidaan auton varaustason noususta. Tankkaus tunnistetaan tankin "
+            "litramäärän noususta (auto ilmoittaa kokonaisia litroja, tarkkuus noin ±1 l). Yksikköhinta on käyttäjän "
+            "itse lisäämä vapaaehtoinen tieto.",
+            S_BODY,
+        ),
+    ]
+    return out
 
 
 def build_year_pdf(
@@ -314,6 +399,8 @@ def build_year_pdf(
         )
     )
     story.append(mt)
+    if not flt.is_partial:
+        story += _year_consumption_table(ctx, year, summary)
 
     filtered_total = 0.0
     for m in range(1, 13):
@@ -329,6 +416,54 @@ def build_year_pdf(
     if include_changes:
         story += _changes_section(ctx, start, end)
     return _render(ctx, story, str(year), footer_note)
+
+
+def _year_consumption_table(ctx: ReportContext, year: int, summary: dict) -> list:
+    has_fuel = ctx.vehicle.has_fuel
+    head = ["Kuukausi", "Ladattu kWh", "josta arvio kWh", "Latauksia"]
+    if has_fuel:
+        head += ["Tankattu l", "Tankkauksia", "Kulunut l", "l/100 km"]
+    data = [[P(h, S_CELL_B) for h in head]]
+    tot = {"kwh": 0.0, "est": 0.0, "n": 0, "l": 0.0, "nl": 0, "used": 0.0}
+    any_data = False
+    for m in summary["months"]:
+        ms, me = timeutil.month_bounds(year, m["month"])
+        c = ctx.consumption_summary(ms, me, m["total_km"])
+        any_data = any_data or c["charge_count"] or c["refuel_count"] or c["fuel_used_l"]
+        row = [P(m["name"]), P(fmt_qty(c["charged_kwh"]), S_CELL_R), P(fmt_qty(c["charged_estimated_kwh"]), S_CELL_R), P(c["charge_count"], S_CELL_R)]
+        tot["kwh"] += c["charged_kwh"]
+        tot["est"] += c["charged_estimated_kwh"]
+        tot["n"] += c["charge_count"]
+        if has_fuel:
+            row += [
+                P(fmt_qty(c["refuelled_l"], 1), S_CELL_R),
+                P(c["refuel_count"], S_CELL_R),
+                P(fmt_qty(c["fuel_used_l"], 1), S_CELL_R),
+                P(fmt_qty(c["fuel_per_100km"], 1), S_CELL_R),
+            ]
+            tot["l"] += c["refuelled_l"]
+            tot["nl"] += c["refuel_count"]
+            tot["used"] += c["fuel_used_l"] or 0
+        data.append(row)
+    if not any_data:
+        return []
+    total_row = [P("Yhteensä", S_CELL_B), P(fmt_qty(tot["kwh"]), S_CELL_B), P(fmt_qty(tot["est"]), S_CELL_B), P(tot["n"], S_CELL_B)]
+    if has_fuel:
+        per100 = tot["used"] / summary["total_km"] * 100 if summary.get("total_km") else None
+        total_row += [P(fmt_qty(tot["l"], 1), S_CELL_B), P(tot["nl"], S_CELL_B), P(fmt_qty(tot["used"], 1), S_CELL_B), P(fmt_qty(per100, 1), S_CELL_B)]
+    data.append(total_row)
+    widths = [30, 26, 28, 22] + ([24, 24, 24, 22] if has_fuel else [])
+    t = Table(data, colWidths=[w * mm for w in widths], repeatRows=1)
+    t.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e2e8f0")),
+            ]
+        )
+    )
+    return [P("Kulut kuukausittain (määrät)", S_H2), t]
 
 
 CHANGE_LABELS = {
@@ -354,6 +489,7 @@ def _changes_section(ctx: ReportContext, start: str, end: str) -> list:
             or f in ("trip", "gap_ack", "period_lock")
             or f.startswith("vehicle_info.")
             or (f == "comment" and "lukituksen jälkeen" in (ch["reason"] or ""))
+            or (f.startswith("consumption:") and not f.endswith((":unit_price", ":comment")))
         )
         if relevant:
             changes.append(ch)
@@ -364,6 +500,10 @@ def _changes_section(ctx: ReportContext, start: str, end: str) -> list:
         label = CHANGE_LABELS.get(ch["field"], ch["field"])
         if ch["field"].startswith("vehicle_info."):
             label = "Autotieto muuttui: " + ch["field"].split(".", 1)[1]
+        elif ch["field"].startswith("consumption:"):
+            parts = ch["field"].split(":")
+            what = {"quantity": "määrä korjattu", "voided": "poistettu laskennasta"}.get(parts[2] if len(parts) > 2 else "", "kirjattu käsin")
+            label = f"Kulu {parts[1]}: {what}"
         old, new = ch["old_value"] or "", ch["new_value"] or ""
         if ch["field"] in ("start_time", "end_time"):
             old, new = timeutil.fmt_datetime(old) if old else "", timeutil.fmt_datetime(new) if new else ""

@@ -15,9 +15,14 @@ SENSORS = {
     "last_trip_route": {"name": "Viimeisin reitti", "icon": "mdi:routes"},
     "month_business_km": {"name": "Työajot tässä kuussa", "unit_of_measurement": "km", "icon": "mdi:briefcase"},
     "month_private_km": {"name": "Yksityisajot tässä kuussa", "unit_of_measurement": "km", "icon": "mdi:home"},
+    "month_charged_kwh": {"name": "Ladattu tässä kuussa", "unit_of_measurement": "kWh", "icon": "mdi:ev-station"},
+    "month_refuelled_l": {"name": "Tankattu tässä kuussa", "unit_of_measurement": "L", "icon": "mdi:gas-station"},
+    "month_fuel_used_l": {"name": "Polttoainetta kulunut tässä kuussa", "unit_of_measurement": "L", "icon": "mdi:fuel"},
     "last_export": {"name": "Raportit kirjoitettu", "icon": "mdi:file-export"},
     "last_import": {"name": "Viimeisin Excel-tuonti", "icon": "mdi:file-import"},
 }
+
+FUEL_SENSORS = ("month_refuelled_l", "month_fuel_used_l")
 
 
 async def supervisor_mqtt_config() -> dict | None:
@@ -72,6 +77,8 @@ class MqttPublisher:
             "model": vehicle.display_name,
         }
         for key, meta in SENSORS.items():
+            if key in FUEL_SENSORS and not getattr(vehicle, "has_fuel", True):
+                continue
             uid = f"bmw_logbook_{vehicle.id}_{key}"
             payload = {
                 **meta,
