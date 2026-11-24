@@ -19,7 +19,7 @@ from .csv_report import build_csv
 from .database import EDITABLE_FIELDS, TRIP_TYPE_LABELS, LogbookError
 from .integrity import purpose_issues, summarize
 from .pdf_report import build_month_pdf, build_year_pdf
-from .report_data import APP_VERSION, MONTH_NAMES, ReportFilter, fmt_km, trip_row
+from .report_data import APP_VERSION, MONTH_NAMES, ReportFilter, consumption_row, fmt_km, fmt_qty, trip_row
 from .service import LockBlocked, VehicleService
 from .xlsx_report import ImportRejected, build_xlsx
 
@@ -57,6 +57,7 @@ SOURCE_LABELS = {
     "gap_fill": "aukon täyttö",
     "period": "jakso",
     "vehicle_info": "asetussivu",
+    "consumption": "kulu",
 }
 
 
@@ -74,6 +75,7 @@ def create_app(app_state, restrict: bool | None = None) -> FastAPI:
         FIELD_LABELS=FIELD_LABELS,
         SOURCE_LABELS=SOURCE_LABELS,
         APP_VERSION=APP_VERSION,
+        qty=fmt_qty,
     )
     api.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     if restrict is None:
@@ -341,6 +343,104 @@ def create_app(app_state, restrict: bool | None = None) -> FastAPI:
         trip = svc.db.get_trip(next)
         y, m = timeutil.local_year_month(trip["start_time"])
         return redirect(request, f"/v/{vid}", msg="Aukko kuitattu ja kirjattu muutoslokiin.", year=y, month=m)
+
+    # --------------------------------------------------------------- kulut
+    @api.get("/v/{vid}/costs", response_class=HTMLResponse)
+    async def costs(request: Request, vid: str, year: int | None = None, month: int | None = None):
+        svc = svc_or_404(vid)
+        dy, dm = default_period()
+        year = year or dy
+        month = dm if month is None and year == dy else (month if month is not None else 0)
+        start, end = timeutil.month_bounds(year, month) if month else timeutil.year_bounds(year)
+        events = svc.db.list_consumption(start, end)
+        rows = []
+        for e in events:
+            r = consumption_row(e)
+            r["locked"] = svc.db.is_locked(*timeutil.local_year_month(e["start_time"]))
+            rows.append(r)
+        km = summarize(svc.db.list_trips(start, end))["total_km"]
+        years = sorted({timeutil.local_year_month(t["start_time"])[0] for t in svc.db.list_trips()} | {dy})
+        return render(
+            request,
+            "costs.html",
+            svc=svc,
+            v=svc.vehicle,
+            rows=rows,
+            c=svc.ctx.consumption_summary(start, end, km),
+            year=year,
+            month=month,
+            years=years,
+            snapshot=svc.consumption.snapshot() if svc.consumption else {},
+        )
+
+    @api.post("/v/{vid}/costs/{eid}/field")
+    async def cost_field(request: Request, vid: str, eid: int):
+        svc = svc_or_404(vid)
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+        else:
+            body = dict(await request.form())
+        field = str(body.get("field", ""))
+        if field not in ("unit_price", "comment"):
+            return JSONResponse({"ok": False, "error": "Tätä kenttää ei voi muokata pikamuokkauksella."}, status_code=400)
+        try:
+            ev = svc.update_consumption(eid, field, body.get("value"), source="ui")
+        except LogbookError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return {"ok": True, "event": {k: ev[k] for k in ("id", "unit_price", "comment")}}
+
+    @api.post("/v/{vid}/costs/{eid}/correct")
+    async def cost_correct(
+        request: Request,
+        vid: str,
+        eid: int,
+        quantity: str = Form(""),
+        voided: str = Form(""),
+        reason: str = Form(""),
+        year: str = Form(""),
+        month: str = Form(""),
+    ):
+        svc = svc_or_404(vid)
+        back = dict(year=year, month=month)
+        try:
+            if voided:
+                svc.update_consumption(eid, "voided", "1", source="ui", reason=reason)
+                return redirect(request, f"/v/{vid}/costs", msg="Kulu poistettu laskennasta ja kirjattu muutoslokiin.", **back)
+            svc.update_consumption(eid, "quantity", quantity, source="ui", reason=reason)
+        except LogbookError as exc:
+            return redirect(request, f"/v/{vid}/costs", err=str(exc), **back)
+        return redirect(request, f"/v/{vid}/costs", msg="Korjaus tallennettu ja kirjattu muutoslokiin.", **back)
+
+    @api.post("/v/{vid}/costs/new")
+    async def cost_new(
+        request: Request,
+        vid: str,
+        kind: str = Form(...),
+        start_time: str = Form(...),
+        quantity: str = Form(...),
+        address: str = Form(""),
+        unit_price: str = Form(""),
+        comment: str = Form(""),
+        reason: str = Form(""),
+    ):
+        svc = svc_or_404(vid)
+        try:
+            if kind == "refuel" and not svc.vehicle.has_fuel:
+                raise LogbookError("Sähköautolle ei voi kirjata tankkausta.")
+            try:
+                q = float(quantity.replace(",", "."))
+                price = float(unit_price.replace(",", ".")) if unit_price.strip() else None
+            except ValueError as exc:
+                raise LogbookError("Määrän ja yksikköhinnan on oltava lukuja.") from exc
+            ts = timeutil.local_naive_to_iso(start_time)
+            svc.add_manual_consumption(
+                {"kind": kind, "start_time": ts, "quantity": q, "address": address, "unit_price": price, "comment": comment},
+                reason=reason,
+            )
+        except (LogbookError, ValueError) as exc:
+            return redirect(request, f"/v/{vid}/costs", err=str(exc))
+        y, m = timeutil.local_year_month(ts)
+        return redirect(request, f"/v/{vid}/costs", msg="Kulu kirjattu.", year=y, month=m)
 
     # ------------------------------------------------------------ raportit
     @api.get("/v/{vid}/reports", response_class=HTMLResponse)

@@ -47,7 +47,17 @@ CHANGE_SOURCES = (
     "gap_fill",
     "period",
     "vehicle_info",
+    "consumption",
 )
+
+CONSUMPTION_KINDS = {"charge": "Lataus", "refuel": "Tankkaus"}
+CONSUMPTION_SOURCES = {
+    "charger": "mitattu laturista",
+    "estimate": "arvio varaustasosta",
+    "tank_level": "tankin mittarista",
+    "manual": "käsin kirjattu",
+}
+CONSUMPTION_UNITS = {"charge": "kWh", "refuel": "l"}
 
 
 class LogbookError(Exception):
@@ -140,6 +150,24 @@ CREATE TABLE IF NOT EXISTS import_conflicts (
     resolved_at TEXT, resolution TEXT
 );
 CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS consumption_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vehicle_id TEXT NOT NULL CHECK (vehicle_id = '{vehicle_id}'),
+    kind TEXT NOT NULL CHECK (kind IN ('charge','refuel')),
+    start_time TEXT NOT NULL, end_time TEXT,
+    lat REAL, lon REAL, address TEXT NOT NULL DEFAULT '', at_home INTEGER NOT NULL DEFAULT 0,
+    method TEXT, soc_start REAL, soc_end REAL, fuel_before REAL, fuel_after REAL,
+    quantity REAL NOT NULL, unit TEXT NOT NULL CHECK (unit IN ('kWh','l')),
+    source TEXT NOT NULL CHECK (source IN ('charger','estimate','tank_level','manual')),
+    orig_quantity REAL, estimated_kwh REAL,
+    unit_price REAL,
+    comment TEXT NOT NULL DEFAULT '',
+    corrected INTEGER NOT NULL DEFAULT 0,
+    voided INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_start ON consumption_events(start_time);
+CREATE TABLE IF NOT EXISTS fuel_readings (ts TEXT PRIMARY KEY, litres REAL NOT NULL);
 """
 
 
@@ -684,6 +712,163 @@ class VehicleDB:
                 "UPDATE import_conflicts SET resolved_at=?, resolution=? WHERE id=?",
                 (timeutil.now_iso(), choice, conflict_id),
             )
+
+    # ------------------------------------------------------------ kulut
+    def insert_consumption(self, event: dict, reason: str | None = None) -> int:
+        """Tallentaa latauksen tai tankkauksen. Käsin lisätty kirjataan muutoslokiin."""
+        kind = event.get("kind")
+        if kind not in CONSUMPTION_KINDS:
+            raise LogbookError(f"Tuntematon kulutyyppi {kind}")
+        source = event.get("source") or "manual"
+        if source not in CONSUMPTION_SOURCES:
+            raise ValueError(source)
+        qty = event.get("quantity")
+        if qty is None or float(qty) <= 0:
+            raise LogbookError("Määrän on oltava suurempi kuin nolla.")
+        y, m = timeutil.local_year_month(event["start_time"])
+        if source == "manual" and self.is_locked(y, m):
+            raise PeriodLockedError(f"Jakso {m:02d}/{y} on lukittu. Kulua ei voi lisätä.")
+        price = event.get("unit_price")
+        now = timeutil.now_iso()
+        cols = {
+            "vehicle_id": self.vehicle_id,
+            "kind": kind,
+            "start_time": event["start_time"],
+            "end_time": event.get("end_time") or event["start_time"],
+            "lat": event.get("lat"),
+            "lon": event.get("lon"),
+            "address": event.get("address") or "",
+            "at_home": int(bool(event.get("at_home"))),
+            "method": event.get("method"),
+            "soc_start": event.get("soc_start"),
+            "soc_end": event.get("soc_end"),
+            "fuel_before": event.get("fuel_before"),
+            "fuel_after": event.get("fuel_after"),
+            "quantity": round(float(qty), 2),
+            "unit": CONSUMPTION_UNITS[kind],
+            "source": source,
+            "orig_quantity": round(float(qty), 2),
+            "estimated_kwh": event.get("estimated_kwh"),
+            "unit_price": None if price in (None, "") else float(price),
+            "comment": event.get("comment") or event.get("note") or "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self.tx() as c:
+            cur = c.execute(
+                f"INSERT INTO consumption_events({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                list(cols.values()),
+            )
+            eid = cur.lastrowid
+            if source == "manual":
+                summary = f"{CONSUMPTION_KINDS[kind]} {event['start_time']}, {_s(cols['quantity'])} {cols['unit']}"
+                self._log(c, None, f"consumption:{eid}", None, summary, "consumption", reason or "Käsin kirjattu kulu")
+        return eid
+
+    def get_consumption(self, event_id: int) -> dict | None:
+        rows = self.query("SELECT * FROM consumption_events WHERE id=?", (event_id,))
+        return rows[0] if rows else None
+
+    def require_consumption(self, event_id: int) -> dict:
+        ev = self.get_consumption(event_id)
+        if ev is None:
+            raise LogbookError(f"Kulua {event_id} ei ole tämän auton ({self.vehicle_id}) kirjanpidossa.")
+        return ev
+
+    def list_consumption(
+        self, start_iso: str | None = None, end_iso: str | None = None, include_voided: bool = False, kind: str | None = None
+    ) -> list[dict]:
+        sql = "SELECT * FROM consumption_events WHERE 1=1"
+        params: list[Any] = []
+        if not include_voided:
+            sql += " AND voided=0"
+        if start_iso:
+            sql += " AND start_time >= ?"
+            params.append(start_iso)
+        if end_iso:
+            sql += " AND start_time < ?"
+            params.append(end_iso)
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        return self.query(sql + " ORDER BY start_time, id", params)
+
+    def update_consumption(
+        self, event_id: int, field: str, value: Any, source: str = "ui", reason: str | None = None
+    ) -> dict:
+        """Yksikköhinta ja kommentti ovat vapaita (myös lukitulla jaksolla). Määrän korjaus ja
+        mitätöinti vaativat perustelun eivätkä onnistu lukitulla jaksolla."""
+        if field not in ("unit_price", "comment", "quantity", "voided"):
+            raise LogbookError(f"Kenttää {field} ei voi muokata.")
+        if source not in CHANGE_SOURCES:
+            raise ValueError(source)
+        ev = self.require_consumption(event_id)
+        y, m = timeutil.local_year_month(ev["start_time"])
+        locked = self.is_locked(y, m)
+        if field in ("quantity", "voided"):
+            if locked:
+                raise PeriodLockedError(f"Jakso {m:02d}/{y} on lukittu. Määrää ei voi muuttaa.")
+            if not (reason or "").strip():
+                raise LogbookError("Mitatun määrän korjaus tai kulun poisto vaatii perustelun.")
+        if field == "unit_price":
+            if value in (None, ""):
+                value = None
+            else:
+                try:
+                    value = float(str(value).replace(",", ".").replace("€", "").strip())
+                except ValueError as exc:
+                    raise LogbookError(f"Yksikköhinta '{value}' ei ole luku.") from exc
+                if value < 0:
+                    raise LogbookError("Yksikköhinta ei voi olla negatiivinen.")
+                value = round(value, 4)
+        elif field == "quantity":
+            try:
+                value = round(float(str(value).replace(",", ".")), 2)
+            except ValueError as exc:
+                raise LogbookError(f"Määrä '{value}' ei ole luku.") from exc
+            if value <= 0:
+                raise LogbookError("Määrän on oltava suurempi kuin nolla.")
+        elif field == "voided":
+            value = 1 if str(value).lower() in ("1", "true", "on", "yes") else 0
+        else:
+            value = "" if value is None else str(value).strip()
+        old = ev[field]
+        if _s(old) == _s(value) or (old in (None, "") and value in (None, "")):
+            return ev
+        sets = {field: value, "updated_at": timeutil.now_iso()}
+        if field == "quantity":
+            sets["corrected"] = 1
+        with self.tx() as c:
+            c.execute(
+                f"UPDATE consumption_events SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
+                [*sets.values(), event_id],
+            )
+            if locked:
+                reason = (reason + "; " if reason else "") + "muutettu lukituksen jälkeen"
+            self._log(c, None, f"consumption:{event_id}:{field}", old, value, source, reason)
+        return self.require_consumption(event_id)
+
+    def set_consumption_address(self, event_id: int, address: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE consumption_events SET address=? WHERE id=? AND address=''", (address, event_id))
+
+    def add_fuel_reading(self, ts_iso: str, litres: float) -> None:
+        with self._lock:
+            self.conn.execute("INSERT OR REPLACE INTO fuel_readings(ts, litres) VALUES (?, ?)", (ts_iso, float(litres)))
+
+    def fuel_readings(self, start_iso: str | None = None, end_iso: str | None = None) -> list[dict]:
+        sql, params = "SELECT ts, litres FROM fuel_readings WHERE 1=1", []
+        if start_iso:
+            sql += " AND ts >= ?"
+            params.append(start_iso)
+        if end_iso:
+            sql += " AND ts < ?"
+            params.append(end_iso)
+        return self.query(sql + " ORDER BY ts", params)
+
+    def fuel_reading_before(self, iso: str) -> dict | None:
+        rows = self.query("SELECT ts, litres FROM fuel_readings WHERE ts < ? ORDER BY ts DESC LIMIT 1", (iso,))
+        return rows[0] if rows else None
 
     # ------------------------------------------------------- ylläpito ja varmuus
     def integrity_check(self) -> str:

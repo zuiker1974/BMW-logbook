@@ -6,6 +6,9 @@ configuration:
       make/model = merkki ja malli, powertrain = PHEV tai BEV, vin = valmistenumero (17 merkkiä tai tyhjä),
       driver = kuljettaja, enabled = kirjataanko auton ajoja, charging_pause_* = lataustauon tunnistus
       kesken matkan (sekunteina), entity_* = auton Home Assistant -entiteetit (location ja odometer pakollisia).
+      Kululaskenta: entity_fuel_level = tankin litramäärä (vain PHEV), entity_charger_energy = kotilaturin
+      istuntokohtainen energia (esim. sensor.abb_energy_delivered), charge_kwh_per_pct = arviokerroin kWh per
+      varausprosentti muualla ladattaessa (530e noin 0,12).
   export_dir:
     name: Raporttikansio
     description: Kansio, johon raportit, arkisto ja varmuuskopiot kirjoitetaan (Rclone Backup vie sen Driveen).
@@ -59,6 +62,9 @@ configuration:
   nominatim_user_agent:
     name: Nominatim User-Agent
     description: Tunniste OpenStreetMapin osoitehakuun.
+  refuel_min_l:
+    name: Tankkauksen vähimmäismäärä (l)
+    description: Tankin litramäärän nousu, joka kirjataan tankkaukseksi (pienemmät heilahdukset ohitetaan).
   log_level:
     name: Lokitaso
     description: Lokin yksityiskohtaisuus.

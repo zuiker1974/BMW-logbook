@@ -18,13 +18,19 @@ ROLES = (
     "charging_state",
     "charging_method",
     "hv_system_state",
+    "fuel_level",
+    "charger_energy",
 )
+# Kululaskennan roolit: näitä ei syötetä ajotunnistukselle
+CONSUMPTION_ROLES = ("fuel_level", "charger_energy")
 REQUIRED_ROLES = ("location", "odometer")
 
 VEHICLE_ID_RE = re.compile(r"^[a-z0-9_]{2,16}$")
 VIN_RE = re.compile(r"^$|^[A-HJ-NPR-Z0-9]{17}$")
 
 DEFAULT_PAUSE_TIMEOUT = {"PHEV": 2700, "BEV": 5400}
+# Arviokerroin (kWh seinästä / varaus-%) muualla kuin kotilaturilla ladattaessa
+DEFAULT_KWH_PER_PCT = {"PHEV": 0.12, "BEV": 0.0}
 
 
 @dataclass
@@ -39,6 +45,7 @@ class VehicleConfig:
     enabled: bool = True
     charging_pause_enabled: bool = True
     charging_pause_timeout_s: int = 2700
+    charge_kwh_per_pct: float = 0.0
     entities: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -58,6 +65,10 @@ class VehicleConfig:
 
     def entity(self, role: str) -> str:
         return self.entities.get(role, "") or ""
+
+    @property
+    def has_fuel(self) -> bool:
+        return self.powertrain == "PHEV"
 
     def entity_ids(self) -> list[str]:
         return [e for e in self.entities.values() if e]
@@ -85,6 +96,7 @@ class Settings:
     commute_counts_as_private: bool = True
     archive_filtered: list[str] = field(default_factory=lambda: ["business"])
     nominatim_user_agent: str = "bmw-logbook-fi/0.1"
+    refuel_min_l: float = 3.0
     log_level: str = "info"
 
     def vehicle(self, vehicle_id: str) -> VehicleConfig | None:
@@ -106,6 +118,7 @@ def _vehicle_from_dict(raw: dict) -> VehicleConfig:
     powertrain = str(raw.get("powertrain") or "PHEV").upper()
     entities = {role: str(raw.get(f"entity_{role}") or "").strip() for role in ROLES}
     timeout = raw.get("charging_pause_timeout_s")
+    kwh_pct = raw.get("charge_kwh_per_pct")
     return VehicleConfig(
         id=str(raw.get("id", "")).strip(),
         plate=str(raw.get("plate") or "").strip().upper(),
@@ -117,6 +130,7 @@ def _vehicle_from_dict(raw: dict) -> VehicleConfig:
         enabled=bool(raw.get("enabled", True)),
         charging_pause_enabled=bool(raw.get("charging_pause_enabled", True)),
         charging_pause_timeout_s=int(timeout if timeout is not None else DEFAULT_PAUSE_TIMEOUT.get(powertrain, 2700)),
+        charge_kwh_per_pct=float(kwh_pct if kwh_pct is not None else DEFAULT_KWH_PER_PCT.get(powertrain, 0.0)),
         entities=entities,
     )
 
@@ -141,11 +155,13 @@ def parse_settings(options: dict, data_dir: str = "/data") -> Settings:
         "commute_counts_as_private",
         "archive_filtered",
         "nominatim_user_agent",
+        "refuel_min_l",
         "log_level",
     ):
         if key in options and options[key] is not None:
             setattr(s, key, options[key])
     s.odometer_gap_tolerance_km = float(s.odometer_gap_tolerance_km)
+    s.refuel_min_l = float(s.refuel_min_l)
 
     seen: set[str] = set()
     for raw in options.get("vehicles") or []:
@@ -159,6 +175,8 @@ def parse_settings(options: dict, data_dir: str = "/data") -> Settings:
             errors.append("VIN on virheellinen (17 merkkiä, ei I, O tai Q).")
         if v.powertrain not in ("PHEV", "BEV"):
             errors.append("Voimalinjan on oltava PHEV tai BEV.")
+        if v.entity("fuel_level") and not v.has_fuel:
+            errors.append("Polttoaine-entiteetti on asetettu sähköautolle (BEV).")
         if v.enabled:
             for role in REQUIRED_ROLES:
                 if not v.entity(role):

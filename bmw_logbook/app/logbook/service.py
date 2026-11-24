@@ -40,7 +40,9 @@ class VehicleService:
         self.ctx = ReportContext(self.db, vehicle, settings)
         self.exporter = Exporter(settings, vehicle)
         self.state_path = data_dir / "active_trip.json"
+        self.consumption_state_path = data_dir / "consumption_state.json"
         self.trip_manager = None  # asetetaan main.py:ssä
+        self.consumption = None  # asetetaan main.py:ssä
         self.dirty_months: set[tuple[int, int]] = set()
         self.dirty_since: datetime | None = None
         self.last_export: str | None = self.db.get_state("last_export")
@@ -68,6 +70,30 @@ class VehicleService:
         except Exception:
             _LOG.exception("%s: varmuuskopio epäonnistui", self.vehicle_id)
         return trip_id
+
+    # ---------------------------------------------------------------- kulut
+    def on_consumption(self, event: dict) -> int:
+        eid = self.db.insert_consumption(event)
+        _LOG.info(
+            "%s: tallennettu kulu %s (%s %.2f %s)", self.vehicle_id, eid, event["kind"], event["quantity"], event.get("unit", "")
+        )
+        self.mark_dirty_time(event["start_time"])
+        return eid
+
+    def on_fuel_reading(self, ts_iso: str, litres: float) -> None:
+        self.db.add_fuel_reading(ts_iso, litres)
+        self.mark_dirty_time(ts_iso)
+
+    def add_manual_consumption(self, event: dict, reason: str = "") -> int:
+        event = dict(event, source="manual")
+        eid = self.db.insert_consumption(event, reason=reason)
+        self.mark_dirty_time(event["start_time"])
+        return eid
+
+    def update_consumption(self, event_id: int, field: str, value, source: str = "ui", reason: str | None = None) -> dict:
+        ev = self.db.update_consumption(event_id, field, value, source=source, reason=reason)
+        self.mark_dirty_time(ev["start_time"])
+        return ev
 
     def mark_dirty_time(self, iso: str) -> None:
         with self._lock:
@@ -265,6 +291,10 @@ class VehicleService:
             raise
         for tid in res.changed_trip_ids:
             self.mark_dirty_trip(tid)
+        for eid in res.changed_consumption_ids:
+            ev = self.db.get_consumption(eid)
+            if ev:
+                self.mark_dirty_time(ev["start_time"])
         self.last_import = f"{timeutil.fmt_datetime(timeutil.now_iso())}: {res.status_text()}"
         self.db.set_state("last_import", self.last_import)
         return res

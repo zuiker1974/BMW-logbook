@@ -12,8 +12,12 @@ from . import timeutil
 from .geocode import Geocoder
 from .ha_client import HAClient, state_timestamp
 from .service import VehicleService
+from .consumption import ConsumptionTracker
 from .trip_manager import NOT_CONFIGURED, STATUS_LABELS, Event, TripManager, Zone
-from .vehicle_registry import Settings, load_settings
+from .vehicle_registry import CONSUMPTION_ROLES, Settings, load_settings
+
+# Kululaskennan tilakone tarvitsee nämä roolit (ajotunnistus ei käytä kulurooleja)
+CONSUMPTION_INPUTS = set(CONSUMPTION_ROLES) | {"location", "soc", "charging_method"}
 
 _LOG = logging.getLogger("logbook")
 
@@ -26,7 +30,8 @@ class LogbookApp:
         self.settings = settings
         self.services: dict[str, VehicleService] = {}
         self.vehicle_errors: dict[str, list[str]] = dict(settings.vehicle_errors)
-        self.entity_map: dict[str, tuple[str, str]] = {}
+        # sama entiteetti (esim. kotilaturin energia) voi kuulua usealle autolle
+        self.entity_map: dict[str, list[tuple[str, str]]] = {}
         self.zones: list[Zone] = []
         self.ha: HAClient | None = None
         self.ha_connected = False
@@ -44,6 +49,15 @@ class LogbookApp:
                 svc = VehicleService(v, settings)
                 svc.trip_manager = TripManager(
                     v, settings, on_trip_finished=svc.on_trip_finished, state_path=svc.state_path, zones=self.zones
+                )
+                svc.consumption = ConsumptionTracker(
+                    v,
+                    settings,
+                    on_charge=svc.on_consumption,
+                    on_refuel=svc.on_consumption,
+                    on_fuel_reading=svc.on_fuel_reading,
+                    state_path=svc.consumption_state_path,
+                    zones=self.zones,
                 )
                 self.services[v.id] = svc
             except Exception as exc:  # yhden auton vika ei estä toista
@@ -111,7 +125,7 @@ class LogbookApp:
                     if role in ("location", "odometer"):
                         missing_required = True
                 else:
-                    self.entity_map[eid] = (vid, role)
+                    self.entity_map.setdefault(eid, []).append((vid, role))
             status["_not_configured"] = missing_required
             svc.entity_status = status
         queue: asyncio.Queue = asyncio.Queue()
@@ -143,10 +157,12 @@ class LogbookApp:
         now = timeutil.now_utc()
         for vid, svc in self.services.items():
             tm = svc.trip_manager
-            eids = [eid for eid, (v, _) in self.entity_map.items() if v == vid]
+            eids = [eid for eid, targets in self.entity_map.items() if any(v == vid for v, _ in targets)]
             if not eids:
                 continue
-            last = timeutil.parse_iso(tm.last_ts) if tm.last_ts else None
+            tm_last = timeutil.parse_iso(tm.last_ts) if tm.last_ts else None
+            ct_last = timeutil.parse_iso(svc.consumption.last_ts) if svc.consumption and svc.consumption.last_ts else None
+            last = min((t for t in (tm_last, ct_last) if t is not None), default=None)
             events: list[tuple[datetime, str, dict]] = []
             if last is not None and self.settings.backfill_max_hours > 0:
                 start = max(last, now - timedelta(hours=self.settings.backfill_max_hours))
@@ -165,8 +181,21 @@ class LogbookApp:
                 for eid in eids:
                     events.append((state_timestamp(by_id[eid]), eid, by_id[eid]))
             events.sort(key=lambda e: e[0])
-            for _, eid, st in events:
-                self._route(eid, st)
+            seed = ct_last is None and svc.consumption is not None
+            if seed:
+                # Kululaskenta käynnistyy ensimmäistä kertaa: aloitetaan nykytilasta (esim. auto on jo kytketty)
+                current = sorted(((state_timestamp(by_id[e]), e) for e in eids if e in by_id), key=lambda x: x[0])
+                for _, eid in current:
+                    self._route(eid, by_id[eid], only=vid, skip_trip=True)
+            for ts, eid, st in events:
+                # kumpikin tilakone saa vain tapahtumat, joita se ei ole vielä käsitellyt
+                self._route(
+                    eid,
+                    st,
+                    only=vid,
+                    skip_trip=tm_last is not None and ts <= tm_last,
+                    skip_consumption=seed or (ct_last is not None and ts <= ct_last),
+                )
 
     async def _consume(self, queue: asyncio.Queue, client: HAClient) -> None:
         while not client.closed.is_set():
@@ -179,29 +208,36 @@ class LogbookApp:
             except Exception:
                 _LOG.exception("Tapahtuman %s käsittely epäonnistui", eid)
 
-    def _route(self, eid: str, st: dict) -> None:
+    def _route(
+        self, eid: str, st: dict, only: str | None = None, skip_trip: bool = False, skip_consumption: bool = False
+    ) -> None:
         if eid == self.settings.stream_status_entity:
             self._set_stream(st.get("state"))
             return
-        target = self.entity_map.get(eid)
-        if not target:
-            return
-        vid, role = target
-        svc = self.services.get(vid)
-        if svc is None:
-            return
-        tm = svc.trip_manager
-        ev = Event(role=role, state=str(st.get("state", "")), attributes=st.get("attributes") or {}, ts=state_timestamp(st))
-        if role == "odometer":
-            try:
-                value = float(ev.state)
-                svc.record_odometer_boundary(value, timeutil.to_iso(ev.ts), tm.s.odometer)
-            except ValueError:
-                pass
-        try:
-            tm.process(ev)
-        except Exception:
-            _LOG.exception("%s: tilakoneen virhe", vid)
+        for vid, role in self.entity_map.get(eid) or []:
+            if only is not None and vid != only:
+                continue
+            svc = self.services.get(vid)
+            if svc is None:
+                continue
+            ev = Event(role=role, state=str(st.get("state", "")), attributes=st.get("attributes") or {}, ts=state_timestamp(st))
+            if role not in CONSUMPTION_ROLES and not skip_trip:
+                tm = svc.trip_manager
+                if role == "odometer":
+                    try:
+                        value = float(ev.state)
+                        svc.record_odometer_boundary(value, timeutil.to_iso(ev.ts), tm.s.odometer)
+                    except ValueError:
+                        pass
+                try:
+                    tm.process(ev)
+                except Exception:
+                    _LOG.exception("%s: tilakoneen virhe", vid)
+            if role in CONSUMPTION_INPUTS and svc.consumption is not None and not skip_consumption:
+                try:
+                    svc.consumption.process(role, ev.state, ev.attributes, ev.ts)
+                except Exception:
+                    _LOG.exception("%s: kululaskennan virhe", vid)
 
     # --------------------------------------------------------- ajastetut
     async def periodic_loop(self) -> None:
@@ -214,6 +250,8 @@ class LogbookApp:
                 try:
                     if self.ha_connected:
                         svc.trip_manager.tick(now)
+                        if svc.consumption is not None:
+                            svc.consumption.tick(now)
                     month = (local.year, local.month)
                     if self._last_month and month != self._last_month:
                         svc.mark_dirty_time(timeutil.month_bounds(*self._last_month)[0])
@@ -258,6 +296,17 @@ class LogbookApp:
                     if addr:
                         svc.db.set_geocoded_address(r["id"], which, addr)
                         svc.mark_dirty_trip(r["id"])
+            events = svc.db.query(
+                "SELECT id, lat, lon FROM consumption_events WHERE address='' AND lat IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (GEOCODE_BATCH,),
+            )
+            for e in events:
+                addr = await self.geocoder.reverse(e["lat"], e["lon"])
+                if addr:
+                    svc.db.set_consumption_address(e["id"], addr)
+                    ev = svc.db.get_consumption(e["id"])
+                    if ev:
+                        svc.mark_dirty_time(ev["start_time"])
             stops = svc.db.query("SELECT id, lat, lon FROM charging_stops WHERE address='' AND lat IS NOT NULL LIMIT ?", (GEOCODE_BATCH,))
             for s in stops:
                 addr = await self.geocoder.reverse(s["lat"], s["lon"])
@@ -285,6 +334,11 @@ class LogbookApp:
                     self.mqtt.publish_state(vid, "last_trip_route", route)
                 self.mqtt.publish_state(vid, "month_business_km", s["business_km"])
                 self.mqtt.publish_state(vid, "month_private_km", s["private_all_km"])
+                c = svc.ctx.consumption_summary(start, end)
+                self.mqtt.publish_state(vid, "month_charged_kwh", c["charged_kwh"])
+                if svc.vehicle.has_fuel:
+                    self.mqtt.publish_state(vid, "month_refuelled_l", c["refuelled_l"])
+                    self.mqtt.publish_state(vid, "month_fuel_used_l", c["fuel_used_l"])
                 self.mqtt.publish_state(vid, "last_export", timeutil.fmt_datetime(svc.last_export) if svc.last_export else "")
                 self.mqtt.publish_state(vid, "last_import", svc.last_import or "")
             except Exception:
@@ -341,6 +395,8 @@ async def amain() -> None:
     for svc in app.services.values():
         try:
             svc.trip_manager.save()
+            if svc.consumption is not None:
+                svc.consumption.save()
             svc.write_reports_if_due(force=True)
         except Exception:
             _LOG.exception("Sammutuksen kirjoitus epäonnistui")
