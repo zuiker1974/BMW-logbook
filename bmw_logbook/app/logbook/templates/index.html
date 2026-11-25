@@ -5,7 +5,7 @@
 {% for c in cards %}
   <div class="card car-card" data-car="{{ c.v.id }}">
     <h3>{{ c.v.display_name }}</h3>
-    <div class="muted">{{ c.v.plate or "rekisteritunnus puuttuu" }} · {{ c.v.id }} · {{ c.v.powertrain }}</div>
+    <div class="muted">{{ c.v.plate or "rekisteritunnus puuttuu" }} · {{ c.v.id }} · {{ c.v.powertrain_label }}</div>
     <p>
       {% set st = c.status %}
       <span class="badge {{ 'drive' if st == 'Ajossa' else ('pause' if st == 'Lataustauolla' else ('off' if st in ('Ei konfiguroitu', 'Ei käytössä') else '')) }}">{{ st }}</span>
@@ -19,8 +19,10 @@
       <div class="flash err small">Pakollisia entiteettejä puuttuu Home Assistantista. Katso Asetukset.</div>
     {% endif %}
     {% if c.svc %}<p><a class="btn" href="{{ base }}/v/{{ c.v.id }}">Avaa ajopäiväkirja</a></p>
-    {% elif not c.v.enabled %}<p class="muted small">Ota auto käyttöön add-onin asetussivulla (enabled), kun sen entiteetit ovat Home Assistantissa.</p>{% endif %}
+    {% elif not c.v.enabled %}<p class="muted small">Ota auto käyttöön <a href="{{ base }}/vehicles#edit-{{ c.v.id }}">Autot-sivulla</a>.</p>{% endif %}
   </div>
+{% else %}
+  <div class="card"><p>Autoja ei ole vielä lisätty.</p><p><a class="btn" href="{{ base }}/vehicles">Lisää auto</a></p></div>
 {% endfor %}
 </div>
 {% endblock %}

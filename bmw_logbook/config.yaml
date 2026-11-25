@@ -1,5 +1,5 @@
 name: BMW-ajopäiväkirja
-version: "0.2.0"
+version: "0.3.0"
 slug: bmw_logbook
 description: Automaattinen ajopäiväkirja BMW-autoille Home Assistantin CarData-datasta (530e, iX3)
 url: https://github.com/zuiker1974/bmw-logbook
@@ -11,6 +11,7 @@ ingress: true
 panel_icon: mdi:car-clock
 panel_title: BMW-ajopäiväkirja
 homeassistant_api: true
+hassio_api: true
 services:
   - mqtt:want
 map:
@@ -84,7 +85,7 @@ schema:
       plate: str
       make: str
       model: str
-      powertrain: list(PHEV|BEV)
+      powertrain: list(PHEV|BEV|ICE)
       vin: match(^$|^[A-HJ-NPR-Z0-9]{17}$)
       driver: str
       enabled: bool

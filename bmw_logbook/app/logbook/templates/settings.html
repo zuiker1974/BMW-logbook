@@ -3,8 +3,8 @@
 {% block content %}
 <h1>Asetukset ja tila</h1>
 <div class="card">
-  <p>Autojen tiedot (rekisteritunnus, merkki, malli, VIN, kuljettaja) ja entiteetit syötetään add-onin asetussivulla:
-  <b>Asetukset → Lisäosat → BMW-ajopäiväkirja → Määritykset</b>. Muutokset tulevat voimaan add-onin uudelleenkäynnistyksellä.</p>
+  <p>Autot (rekisteritunnus, malli, käyttövoima, kuljettaja, entiteetit) hallitaan <a href="{{ base }}/vehicles">Autot-sivulla</a>.
+  Yleiset asetukset ovat lisäosan asetussivulla: <b>Asetukset → Lisäosat → BMW-ajopäiväkirja → Määritykset</b>.</p>
   <p class="small">Home Assistant: {% if app.ha_connected %}✓ yhdistetty{% else %}✗ ei yhteyttä{% if app.ha_error %} ({{ app.ha_error }}){% endif %}{% endif %} ·
   CarData-yhteys: {{ app.stream_state or 'ei tietoa' }} ·
   MQTT-sensorit: {{ 'käytössä' if app.mqtt else 'ei käytössä' }} · Raporttikansio: <code>{{ settings.export_dir }}</code></p>
@@ -13,14 +13,14 @@
 <div class="card">
   <h2>{{ c.v.display_name }} · {{ c.v.plate or "rekisteritunnus puuttuu" }} ({{ c.v.id }})</h2>
   {% for e in c.errors %}<div class="flash err small">{{ e }}</div>{% endfor %}
-  {% if not c.v.enabled %}<p class="muted">Auto ei ole käytössä (enabled: false).</p>{% endif %}
+  {% if not c.v.enabled %}<p class="muted">Auto ei ole käytössä.</p>{% endif %}
   <div class="grid2">
     <div>
       <h3>Autotiedot (vain luku)</h3>
       <table class="simple small">
         <tr><th>Rekisterinumero</th><td>{{ c.v.plate }}</td></tr>
         <tr><th>Merkki ja malli</th><td>{{ c.v.display_name }}</td></tr>
-        <tr><th>Voimalinja</th><td>{{ c.v.powertrain }}</td></tr>
+        <tr><th>Käyttövoima</th><td>{{ c.v.powertrain_label }}</td></tr>
         <tr><th>VIN</th><td>{{ c.v.vin }}</td></tr>
         <tr><th>Kuljettaja</th><td>{{ c.v.driver }}</td></tr>
         <tr><th>Lataustauko</th><td>{{ 'käytössä' if c.v.charging_pause_enabled else 'pois' }}, {{ (c.v.charging_pause_timeout_s // 60) }} min</td></tr>
@@ -38,7 +38,7 @@
         <tr><th>Rooli</th><th>Entiteetti</th><th>Tila</th></tr>
         {% for role, eid in c.v.entities.items() %}
           {% set st = c.entities.get(role) %}
-          <tr><td>{{ role }}</td><td><code>{{ eid or '–' }}</code></td>
+          <tr><td>{{ ROLE_LABELS.get(role, role) }}{% if c.v.entity_source(role) %} <span class="muted">({{ SOURCE_NAMES[c.v.entity_source(role)] }})</span>{% endif %}</td><td><code>{{ eid or '–' }}</code></td>
             <td>{% if not eid %}<span class="muted">ei kartoitettu</span>{% elif st and st.exists %}✓ {{ st.state }}{% elif st %}<b style="color:var(--err)">✗ puuttuu</b>{% else %}<span class="muted">ei tarkistettu</span>{% endif %}</td></tr>
         {% endfor %}
       </table>
