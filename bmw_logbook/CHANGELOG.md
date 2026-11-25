@@ -1,5 +1,13 @@
 # Muutosloki
 
+## 0.3.0
+- Autot löytyvät automaattisesti Home Assistantin CarData-integraatiosta VIN:n perusteella. Entiteettejä ei tarvitse etsiä käsin, ja käsin syötetty entiteetti ohittaa löydetyn.
+- Uusi Autot-sivu: autojen lisäys ja muokkaus (rekisteritunnus, kuljettaja, käyttövoima, polttoaine, lataustauko, entiteetit) ja uudelleenkäynnistys selaimesta. Autot tallennetaan tiedostoon `/data/vehicles.json`.
+- Käyttövoimat BEV, PHEV ja ICE (polttomoottori, myös mild hybrid), ja polttoaine bensiini tai diesel. Ehdotus tulee CarDatan metadatasta.
+- Yhteinen kotilaturi: sama energiamittari usealle autolle, energia kirjataan autolle, jonka varaus nousi.
+- CarData-yhteyden tila-entiteetti löytyy automaattisesti, jos asetettua ei ole.
+- Päivitys siirtää 0.2:n autoasetukset sellaisinaan, eikä mikään entiteetti vaihdu.
+
 ## 0.2.0
 - Kululaskenta (vain määrät): lataukset kWh ja 530e:n tankkaukset litroina, autokohtaisesti.
   - Kotilataus luetaan kotilaturin istuntomittarista (`entity_charger_energy`, esim. `sensor.abb_energy_delivered`), muualla ladattu arvioidaan varaustason noususta (`charge_kwh_per_pct`).

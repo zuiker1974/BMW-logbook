@@ -292,10 +292,14 @@ class ConsumptionTracker:
         if p is None:
             return
         has_charger = bool(self.vehicle.entity("charger_energy"))
-        measured = self._measured(p) if (has_charger and p.at_home and p.segments) else None
         soc_gain = None
         if p.soc_start is not None and p.soc_max is not None:
             soc_gain = max(0.0, p.soc_max - p.soc_start)
+        measured = self._measured(p) if (has_charger and p.at_home and p.segments) else None
+        if measured is not None and self.vehicle.charger_shared and soc_gain is not None and soc_gain <= 0:
+            # Sama kotilaturi on usealla autolla: energia kuuluu autolle, jonka varaus nousi
+            _LOG.info("%s: kytkentä %s ilman varauksen nousua, laturin energia jätetään toiselle autolle", self.vehicle.id, p.start)
+            measured = None
         estimate = None
         if soc_gain and self.vehicle.charge_kwh_per_pct > 0:
             estimate = round(soc_gain * self.vehicle.charge_kwh_per_pct, 2)

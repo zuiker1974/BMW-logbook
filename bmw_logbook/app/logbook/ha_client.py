@@ -1,8 +1,8 @@
 """Home Assistantin WebSocket-asiakas (vain luku).
 
 Käyttää Supervisorin antamaa SUPERVISOR_TOKEN-tunnusta. Palvelu ei koskaan kutsu HA:n
-palveluita eikä muuta entiteettejä: käytössä ovat vain get_states, subscribe_entities ja
-history/history_during_period.
+palveluita eikä muuta entiteettejä: käytössä ovat vain get_states, config/entity_registry/list,
+subscribe_entities ja history/history_during_period.
 """
 from __future__ import annotations
 
@@ -152,6 +152,10 @@ class HAClient:
         for s in states:
             self.states[s["entity_id"]] = s
         return states
+
+    async def entity_registry(self) -> list[dict]:
+        """HA:n entiteettirekisteri (unique_id ja platform autojen löytämiseen)."""
+        return await self.call({"type": "config/entity_registry/list"}) or []
 
     async def history(self, entity_ids: list[str], start: datetime, end: datetime | None = None) -> dict[str, list[dict]]:
         payload = {

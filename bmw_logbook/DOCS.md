@@ -36,66 +36,43 @@ Tekninen määrittely: [docs/bmw_ajopaivakirja_spec_v2.md](docs/bmw_ajopaivakirj
 Lisäosa käyttää Supervisorin omaa tunnusta, joten pitkäikäistä tunnusta ei tarvita. Jos Mosquitto
 MQTT -välittäjä on asennettu, lisäosa luo autokohtaiset sensorit automaattisesti.
 
-## 2. Autojen tiedot ja entiteetit
+## 2. Autot
 
-Kaikki asetukset syötetään lisäosan asetussivulla: **Asetukset → Lisäosat → BMW-ajopäiväkirja →
-Määritykset**. Muutokset tulevat voimaan, kun lisäosa käynnistetään uudelleen.
+Autot hallitaan ajopäiväkirjan **Autot**-sivulla (yläpalkki). Lisäosa löytää autot itse Home
+Assistantin BMW CarData -integraatiosta: jokaisen CarData-entiteetin tunnisteessa on auton VIN, joten
+oikeat entiteetit löytyvät nimistä riippumatta (myös latausentiteetit, joiden nimessä ei ole auton nimeä).
+Metadatasta tulevat merkki, malli ja käyttövoima. Lisäosa ei avaa omaa yhteyttä BMW:lle.
 
-Jokaisella autolla on oma kohta `vehicles`-listassa:
+**Auton lisääminen:** Autot-sivun *Löydetyt autot* -listassa → *Lisää* → tarkista tunniste, syötä
+rekisteritunnus ja kuljettaja → *Lisää auto* → *Käynnistä uudelleen nyt*. Tarkista lopuksi
+Asetukset-sivulta, että entiteeteissä on ✓.
 
 | Kenttä | Merkitys |
 |---|---|
-| `id` | Auton pysyvä tunniste (`530e`, `ix3`). Ei saa muuttaa sen jälkeen, kun autolle on kirjattu matkoja. |
-| `plate` | Rekisteritunnus, esim. `ABC-123`. Näkyy raporteissa ja tiedostonimissä. |
-| `make`, `model`, `powertrain` | Merkki, malli ja voimalinja (`PHEV` tai `BEV`). |
-| `vin` | Valmistenumero (17 merkkiä) tai tyhjä. Excel-tuonti tarkistaa sen. |
-| `driver` | Kuljettaja. |
-| `enabled` | Kirjataanko auton ajoja. |
-| `charging_pause_enabled`, `charging_pause_timeout_s` | Lataustauko kesken matkan: kuinka kauan lataus saa kestää ennen kuin matka katsotaan päättyneeksi (530e 45 min, iX3 90 min). Kotilataus ei koskaan ole lataustauko. |
-| `entity_location`, `entity_odometer` | **Pakolliset**: sijainti (device_tracker) ja matkamittari. |
-| `entity_motion` | Suositeltu: liiketila (binary_sensor). |
-| `entity_soc`, `entity_charging_state`, `entity_charging_method`, `entity_hv_system_state` | Valinnaiset: akun varaus ja lataustiedot. |
-| `entity_fuel_level` | Kululaskenta, vain PHEV: tankin polttoainemäärä litroina. |
-| `entity_charger_energy` | Kululaskenta: kotilaturin istuntokohtainen energia (Wh tai kWh), joka nollautuu kaapelin irrotuksessa. |
-| `charge_kwh_per_pct` | Kululaskenta: kWh per varausprosentti, jolla muualla kuin kotona ladattu energia arvioidaan (530e 0,12, iX3 noin 0,8). 0 = ei arviota. |
+| Tunniste | Auton pysyvä tunniste (esim. `530e`, `ix3`). Tietokanta ja raporttikansiot nimetään sen mukaan, eikä sitä voi muuttaa. |
+| Rekisteritunnus | Näkyy raporteissa ja tiedostonimissä. |
+| Merkki, malli, VIN | Täytetään CarDatasta. VIN yhdistää auton sen entiteetteihin. |
+| Käyttövoima | Täyssähkö (BEV), ladattava hybridi (PHEV) tai polttomoottori (ICE, myös mild hybrid). Määrää, seurataanko latausta, polttoainetta vai molempia. Ehdotus tulee CarDatasta. |
+| Polttoaine | Bensiini tai diesel (PHEV ja ICE). |
+| Lataustauko | Kuinka kauan lataus kesken matkan saa kestää ennen kuin matka katsotaan päättyneeksi. 0 = pois. Kotilataus ei koskaan ole lataustauko. |
+| Arvio kWh / varaus-% | Muualla kuin kotona ladatun energian arvio varauksen noususta (530e 0,12). 0 = ei arviota. |
+| Ladataan kotilaturilla | Käytetäänkö yhteistä kotilaturin energiamittaria. |
+| Etsi entiteetit automaattisesti | Pois päältä vain, jos auto ei ole CarDatassa ja kaikki entiteetit syötetään käsin. |
+| Entiteetit | Tyhjä kenttä = haetaan automaattisesti. Käsin syötetty entiteetti ohittaa löydetyn. Pakolliset: sijainti ja mittarilukema. |
 
-530e:n entiteetit on valmiiksi täytetty (tarkistettu HA:sta 17.11.2026):
+**Kotilaturi** asetetaan kerran Autot-sivulla (esim. `sensor.abb_energy_delivered`). Jos sama laturi
+on usealla autolla, mitattu energia kirjataan autolle, jonka varaus nousi kytkennän aikana.
 
-```yaml
-entity_location: device_tracker.530e_xdrive_location
-entity_odometer: sensor.530e_xdrive_vehicle_mileage
-entity_motion: binary_sensor.autot_530e_xdrive_vehicle_motion_state
-entity_soc: sensor.530e_xdrive_battery_ev_state_of_charge
-entity_charging_state: sensor.charging_ev_charging_state
-entity_charging_method: sensor.charging_ev_charging_method
-entity_hv_system_state: sensor.charging_ev_hv_system_state
-entity_fuel_level: sensor.530e_xdrive_range_tank_level
-entity_charger_energy: sensor.abb_energy_delivered
-charge_kwh_per_pct: 0.12
-```
-
-**Päivitys 0.1.x → 0.2.0:** jos 530e:n asetukset on tallennettu jo aiemmin, lisää kolme viimeistä riviä
-530e:n kohtaan itse (lisäosan päivitys ei muuta tallennettuja asetuksia). Ilman niitä kululaskenta
-toimii vain arviona varaustasosta, eikä tankkauksia kirjata.
-
-Älä nimeä 530e:n entiteettejä uudelleen: latausautomaatiot riippuvat niistä.
-
-### iX3:n lisääminen, kun auto tulee
-
-iX3 on asetuksissa valmiina, mutta pois päältä (`enabled: false`).
-
-1. Kun iX3 näkyy BMW CarData -tilillä, avaa HA: **Asetukset → Laitteet ja palvelut → BMW CarData → iX3**.
-2. Kopioi laitesivulta iX3:n entiteettien tunnisteet (sijainti, matkamittari, liiketila, akun varaus,
-   lataustila ja latausmenetelmä). **Älä arvaa nimiä:** latausentiteeteissä ei ole auton nimeä, joten
-   iX3:n vastaavat saavat todennäköisesti päätteen `_2` (esim. `sensor.charging_ev_charging_state_2`).
-   Varmista jokainen laitesivulta.
-3. Täytä ne iX3:n kohtaan, lisää rekisteritunnus ja VIN, ja vaihda `enabled: true`. Jos iX3 ladataan
-   samalla ABB-laturilla, aseta sille myös `entity_charger_energy: sensor.abb_energy_delivered`.
-   Laturin energia kirjataan sille autolle, joka on kytketty, joten autot pysyvät erillään.
-4. Käynnistä lisäosa uudelleen ja tarkista ajopäiväkirjan Asetukset-sivulta, että kaikissa on ✓.
+Muut kuin CarData-autot toimivat, kun entiteetit syötetään käsin.
 
 Jos pakollinen entiteetti puuttuu, auto näkyy tilassa *Ei konfiguroitu*, eikä se vaikuta toisen auton
 kirjaukseen.
+
+**Päivitys 0.2 → 0.3:** ensimmäisellä käynnistyksellä lisäosan asetussivun `vehicles`-lista siirretään
+tiedostoon `/data/vehicles.json` sellaisenaan. Kaikki aiemmat entiteetit säilyvät käsin asetettuina,
+kotilaturin entiteetti siirtyy yhteiseksi kotilaturiksi ja puuttuva VIN täydennetään CarDatasta.
+Tunnisteet, tietokannat ja raporttikansiot pysyvät ennallaan. Tämän jälkeen asetussivun `vehicles`-listaa
+ei enää lueta.
 
 ### Muut asetukset
 

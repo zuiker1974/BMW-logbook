@@ -20,7 +20,20 @@ from .database import EDITABLE_FIELDS, TRIP_TYPE_LABELS, LogbookError
 from .integrity import purpose_issues, summarize
 from .pdf_report import build_month_pdf, build_year_pdf
 from .report_data import APP_VERSION, MONTH_NAMES, ReportFilter, consumption_row, fmt_km, fmt_qty, trip_row
+from .discovery import suggest_id
 from .service import LockBlocked, VehicleService
+from .vehicle_registry import (
+    FUEL_TYPE_LABELS,
+    FUEL_TYPES,
+    POWERTRAIN_LABELS,
+    POWERTRAINS,
+    ROLES,
+    VehicleConfig,
+    settings_to_store,
+    validate_vehicle,
+    vehicle_from_store,
+    vehicle_to_store,
+)
 from .xlsx_report import ImportRejected, build_xlsx
 
 HERE = Path(__file__).parent
@@ -47,6 +60,18 @@ FIELD_LABELS = {
     "gap_ack": "Mittariaukko kuitattu",
     "period_lock": "Jakson lukitus",
 }
+ROLE_LABELS = {
+    "location": "Sijainti",
+    "odometer": "Mittarilukema",
+    "motion": "Liiketila",
+    "soc": "Ajoakun varaus",
+    "charging_state": "Lataustila",
+    "charging_method": "Latausmenetelmä (kytkentä)",
+    "hv_system_state": "Ajoakun järjestelmän tila",
+    "fuel_level": "Polttoainetta tankissa (l)",
+    "charger_energy": "Laturin energia",
+}
+SOURCE_NAMES = {"manual": "käsin", "auto": "löydetty", "charger": "kotilaturi", "": ""}
 SOURCE_LABELS = {
     "ui": "selain",
     "excel_drive": "Excel (Drive)",
@@ -74,6 +99,13 @@ def create_app(app_state, restrict: bool | None = None) -> FastAPI:
         MONTH_NAMES=MONTH_NAMES,
         FIELD_LABELS=FIELD_LABELS,
         SOURCE_LABELS=SOURCE_LABELS,
+        ROLES=ROLES,
+        ROLE_LABELS=ROLE_LABELS,
+        SOURCE_NAMES=SOURCE_NAMES,
+        POWERTRAINS=POWERTRAINS,
+        POWERTRAIN_LABELS=POWERTRAIN_LABELS,
+        FUEL_TYPES=FUEL_TYPES,
+        FUEL_TYPE_LABELS=FUEL_TYPE_LABELS,
         APP_VERSION=APP_VERSION,
         qty=fmt_qty,
     )
@@ -577,6 +609,141 @@ def create_app(app_state, restrict: bool | None = None) -> FastAPI:
                 }
             )
         return render(request, "settings.html", cars=cars, settings=app_state.settings)
+
+    # --------------------------------------------------------------- autot
+    def current_store() -> dict:
+        data = app_state.store.load()
+        return data if data is not None else settings_to_store(app_state.settings)
+
+    def live_vehicle(raw: dict, home: str) -> VehicleConfig:
+        """Lomakkeen auto, jolle on liitetty HA:sta löydetyt entiteetit (näytetään 'käytössä nyt')."""
+        v = vehicle_from_store(raw, home)
+        d = app_state.discovered.get(v.vin) if v.vin else None
+        v.apply_discovered(d.entities if d else {})
+        return v
+
+    def energy_entities() -> list[str]:
+        out = []
+        states = app_state.ha.states if app_state.ha is not None else {}
+        for eid, st in states.items():
+            unit = str((st.get("attributes") or {}).get("unit_of_measurement") or "")
+            if eid.startswith("sensor.") and unit in ("Wh", "kWh", "MWh"):
+                out.append(eid)
+        return sorted(out)
+
+    @api.get("/vehicles", response_class=HTMLResponse)
+    async def vehicles_page(request: Request, add: str = ""):
+        store = current_store()
+        home = store.get("home_charger_entity", "")
+        forms = []
+        for raw in store["vehicles"]:
+            forms.append({"v": live_vehicle(raw, home), "new": False, "anchor": raw.get("id"), "errors": app_state.vehicle_errors.get(raw.get("id"), []), "hint": {}})
+        by_vin = {str(r.get("vin") or ""): r.get("id") for r in store["vehicles"] if r.get("vin")}
+        discovered = [{"d": d, "configured": by_vin.get(vin)} for vin, d in sorted(app_state.discovered.items())]
+        d = app_state.discovered.get(add.strip().upper()) if add else None
+        taken = {str(r.get("id")) for r in store["vehicles"]}
+        if d is not None and d.vin not in by_vin:
+            raw = {
+                "id": suggest_id(d, taken),
+                "make": d.brand,
+                "model": d.model + (f" ({d.series})" if d.series and d.series not in d.model else ""),
+                "powertrain": d.powertrain or "BEV",
+                "vin": d.vin,
+                "enabled": True,
+                "auto_discover": True,
+                "use_home_charger": bool(home) and (d.powertrain or "BEV") != "ICE",
+            }
+            forms.append({"v": live_vehicle(raw, home), "new": True, "anchor": "new", "errors": [], "hint": {}})
+        else:
+            forms.append({"v": live_vehicle({"id": "", "make": "", "powertrain": "BEV", "auto_discover": True}, home), "new": True, "anchor": "new", "errors": [], "hint": {}})
+        return render(request, "vehicles.html", store=store, forms=forms, discovered=discovered, energy_entities=energy_entities())
+
+    @api.post("/vehicles/save")
+    async def vehicles_save(request: Request):
+        form = await request.form()
+        orig_id = str(form.get("orig_id") or "").strip()
+        store = current_store()
+        try:
+            pause_min = int(str(form.get("charging_pause_min") or "0").strip() or 0)
+            kwh_pct = float(str(form.get("charge_kwh_per_pct") or "0").replace(",", ".").strip() or 0)
+        except ValueError:
+            return redirect(request, "/vehicles", err="Lataustauon ja kWh/%-arvion on oltava numeroita.")
+        raw = {
+            "id": orig_id or str(form.get("id") or "").strip().lower(),
+            "plate": str(form.get("plate") or ""),
+            "make": str(form.get("make") or ""),
+            "model": str(form.get("model") or ""),
+            "powertrain": str(form.get("powertrain") or "BEV"),
+            "fuel_type": str(form.get("fuel_type") or ""),
+            "vin": str(form.get("vin") or "").strip().upper(),
+            "driver": str(form.get("driver") or ""),
+            "enabled": bool(form.get("enabled")),
+            "charging_pause_enabled": pause_min > 0,
+            "charging_pause_timeout_s": max(0, pause_min) * 60,
+            "charge_kwh_per_pct": max(0.0, kwh_pct),
+            "auto_discover": bool(form.get("auto_discover")),
+            "use_home_charger": bool(form.get("use_home_charger")),
+            "entities": {role: str(form.get(f"entity_{role}") or "").strip() for role in ROLES if str(form.get(f"entity_{role}") or "").strip()},
+        }
+        v = vehicle_from_store(raw, store.get("home_charger_entity", ""))
+        errors = validate_vehicle(v)
+        others = [r for r in store["vehicles"] if r.get("id") != orig_id]
+        if not orig_id and any(r.get("id") == v.id for r in store["vehicles"]):
+            errors.append(f"Tunniste '{v.id}' on jo käytössä.")
+        if v.vin and any(str(r.get("vin") or "").upper() == v.vin for r in others):
+            errors.append("Sama VIN on jo toisella autolla.")
+        if orig_id and not any(r.get("id") == orig_id for r in store["vehicles"]):
+            errors.append(f"Autoa '{orig_id}' ei löydy.")
+        # Pakolliset entiteetit tarkistetaan HA:sta löydettyjen kanssa
+        live = live_vehicle(raw, store.get("home_charger_entity", ""))
+        if v.enabled and app_state.ha_connected:
+            for role in ("location", "odometer"):
+                if not live.entity(role):
+                    errors.append(f"Roolille '{ROLE_LABELS[role]}' ei löytynyt entiteettiä. Tarkista VIN tai syötä entiteetti käsin.")
+        if errors:
+            return redirect(request, "/vehicles", err=" ".join(dict.fromkeys(errors)))
+        clean = vehicle_to_store(v)
+        if orig_id:
+            store["vehicles"] = [clean if r.get("id") == orig_id else r for r in store["vehicles"]]
+        else:
+            store["vehicles"].append(clean)
+        app_state.store.save(store)
+        app_state.restart_needed = True
+        return redirect(request, "/vehicles", msg=f"Auto {v.id} tallennettu.")
+
+    @api.post("/vehicles/charger")
+    async def vehicles_charger(request: Request, home_charger_entity: str = Form("")):
+        store = current_store()
+        store["home_charger_entity"] = home_charger_entity.strip()
+        app_state.store.save(store)
+        app_state.restart_needed = True
+        return redirect(request, "/vehicles", msg="Kotilaturi tallennettu.")
+
+    @api.post("/restart")
+    async def restart(request: Request):
+        import asyncio
+        import os as _os
+
+        if not _os.environ.get("SUPERVISOR_TOKEN"):
+            return redirect(request, "/vehicles", err="Uudelleenkäynnistys ei ole käytettävissä. Käynnistä lisäosa uudelleen Home Assistantin lisäosasivulta.")
+
+        async def later():
+            await asyncio.sleep(1)
+            try:
+                await app_state.restart()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception("Uudelleenkäynnistys epäonnistui")
+
+        try:
+            asyncio.get_running_loop().create_task(later())
+        except Exception as exc:
+            return redirect(request, "/vehicles", err=f"Uudelleenkäynnistys epäonnistui ({exc}). Käynnistä lisäosa uudelleen Home Assistantin lisäosasivulta.")
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'><p style='font-family:sans-serif'>Lisäosa käynnistyy uudelleen. "
+            "Päivitä sivu noin puolen minuutin kuluttua.</p>"
+        )
 
     @api.get("/health")
     async def health():

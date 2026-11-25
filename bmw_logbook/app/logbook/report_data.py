@@ -8,7 +8,7 @@ from .database import CONSUMPTION_KINDS, CONSUMPTION_SOURCES, CORRECTION_FIELDS,
 from .integrity import odometer_issues, odometer_reconciliation, summarize
 from .vehicle_registry import Settings, VehicleConfig
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 MONTH_NAMES = [
     "",

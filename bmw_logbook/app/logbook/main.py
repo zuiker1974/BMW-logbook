@@ -14,7 +14,9 @@ from .ha_client import HAClient, state_timestamp
 from .service import VehicleService
 from .consumption import ConsumptionTracker
 from .trip_manager import NOT_CONFIGURED, STATUS_LABELS, Event, TripManager, Zone
-from .vehicle_registry import CONSUMPTION_ROLES, Settings, load_settings
+from .discovery import DiscoveredVehicle, discover, find_stream_status
+from .vehicle_registry import CONSUMPTION_ROLES, REQUIRED_ROLES, Settings, load_settings
+from .vehicle_store import VehicleStore
 
 # Kululaskennan tilakone tarvitsee nämä roolit (ajotunnistus ei käytä kulurooleja)
 CONSUMPTION_INPUTS = set(CONSUMPTION_ROLES) | {"location", "soc", "charging_method"}
@@ -26,8 +28,13 @@ GEOCODE_BATCH = 5
 
 
 class LogbookApp:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store: VehicleStore | None = None):
         self.settings = settings
+        self.store = store or VehicleStore(settings.data_dir)
+        # CarData-integraatiosta löydetyt autot VIN:n mukaan (päivittyy HA-yhteyden auetessa)
+        self.discovered: dict[str, DiscoveredVehicle] = {}
+        self.discovery_error: str | None = None
+        self.restart_needed = False
         self.services: dict[str, VehicleService] = {}
         self.vehicle_errors: dict[str, list[str]] = dict(settings.vehicle_errors)
         # sama entiteetti (esim. kotilaturin energia) voi kuulua usealle autolle
@@ -63,6 +70,20 @@ class LogbookApp:
             except Exception as exc:  # yhden auton vika ei estä toista
                 _LOG.exception("Auton %s käynnistys epäonnistui", v.id)
                 self.vehicle_errors.setdefault(v.id, []).append(str(exc))
+
+    async def restart(self) -> None:
+        """Käynnistää lisäosan uudelleen Supervisorin kautta (autojen muutokset voimaan)."""
+        import aiohttp
+
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            raise RuntimeError("SUPERVISOR_TOKEN puuttuu")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://supervisor/addons/self/restart", headers={"Authorization": f"Bearer {token}"}, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"Supervisor vastasi {resp.status}")
 
     # ------------------------------------------------------------- tilat
     def vehicle_status(self, vehicle_id: str) -> str:
@@ -107,6 +128,7 @@ class LogbookApp:
         states = await client.get_states()
         by_id = {s["entity_id"]: s for s in states}
         self._update_zones(by_id)
+        await self._discover(client, by_id)
         self.entity_map.clear()
         stream_eid = self.settings.stream_status_entity
         if stream_eid and stream_eid in by_id:
@@ -126,6 +148,9 @@ class LogbookApp:
                         missing_required = True
                 else:
                     self.entity_map.setdefault(eid, []).append((vid, role))
+            if any(not svc.vehicle.entity(r) for r in REQUIRED_ROLES):
+                _LOG.warning("%s: pakollisia entiteettejä ei löytynyt (VIN %s)", vid, svc.vehicle.vin or "puuttuu")
+                missing_required = True
             status["_not_configured"] = missing_required
             svc.entity_status = status
         queue: asyncio.Queue = asyncio.Queue()
@@ -136,6 +161,50 @@ class LogbookApp:
         await client.subscribe_entities(watch, lambda eid, st: queue.put_nowait((eid, st)))
         await self._backfill(client, by_id)
         asyncio.create_task(self._consume(queue, client))
+
+    async def _discover(self, client: HAClient, by_id: dict) -> None:
+        """Hakee autojen entiteetit CarData-integraatiosta VIN:n perusteella."""
+        try:
+            registry = await client.entity_registry()
+            self.discovery_error = None
+        except Exception as exc:
+            _LOG.warning("Entiteettirekisteriä ei voitu lukea, automaattinen löytö ohitetaan: %s", exc)
+            self.discovery_error = str(exc)
+            return
+        self.discovered = discover(registry, by_id)
+        for vin, d in self.discovered.items():
+            _LOG.info("CarData-auto löytyi: %s %s (%s), roolit: %s", d.display_name, vin[-6:], d.powertrain or "?", ", ".join(sorted(d.entities)))
+        for v in self.settings.vehicles:
+            if not v.vin:
+                self._fill_vin(v)
+            d = self.discovered.get(v.vin) if v.vin else None
+            v.apply_discovered(d.entities if d else {})
+            svc = self.services.get(v.id)
+            if svc is not None and svc.trip_manager is not None:
+                svc.trip_manager.has_motion = bool(v.entity("motion"))
+        stream = self.settings.stream_status_entity
+        if not stream or stream not in by_id:
+            found = find_stream_status(registry)
+            if found:
+                self.settings.stream_status_entity = found
+
+    def _fill_vin(self, v) -> None:
+        """Täydentää VIN:n autolle, jonka käsin asetetut entiteetit kuuluvat löydettyyn CarData-autoon."""
+        own = set(v.overrides.values())
+        for vin, d in self.discovered.items():
+            if own & set(d.entities.values()):
+                v.vin = vin
+                _LOG.info("%s: VIN täydennetty CarData-integraatiosta", v.id)
+                try:
+                    data = self.store.load()
+                    if data is not None:
+                        for raw in data["vehicles"]:
+                            if raw.get("id") == v.id and not raw.get("vin"):
+                                raw["vin"] = vin
+                        self.store.save(data)
+                except Exception:
+                    _LOG.exception("%s: VIN:n tallennus epäonnistui", v.id)
+                return
 
     def _update_zones(self, by_id: dict) -> None:
         self.zones.clear()
