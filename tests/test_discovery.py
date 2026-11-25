@@ -279,3 +279,31 @@ def test_legacy_settings_pages_still_render(tmp_path):
     c = TestClient(create_app(app, restrict=False))
     assert c.get("/vehicles").status_code == 200
     assert c.get("/").status_code == 200
+
+
+def test_transfer_package_roundtrip(tmp_path):
+    from logbook.transfer import export_package, import_package_if_fresh, package_path
+
+    old = tmp_path / "old"
+    share = tmp_path / "share"
+    VehicleStore(old).load_or_migrate(V02_OPTIONS)
+    s = parse_settings(V02_OPTIONS, data_dir=str(old), store=VehicleStore(old).load())
+    s.export_dir = str(share)
+    app = LogbookApp(s, store=VehicleStore(old))
+    from test_logbook import trip
+
+    app.services["530e"].db.insert_trip(trip(1, 6, 10000, 15, "business", "Asiakas"))
+    (old / "options.json").write_text("{}")
+    export_package(old, share, app.services)
+    assert package_path(share).exists()
+    new = tmp_path / "new"
+    assert import_package_if_fresh(new, share)
+    assert not package_path(share).exists()
+    assert (new / "vehicles.json").exists() and not (new / "options.json").exists()
+    s2 = parse_settings({}, data_dir=str(new), store=VehicleStore(new).load())
+    s2.export_dir = str(share)
+    app2 = LogbookApp(s2, store=VehicleStore(new))
+    assert len(app2.services["530e"].db.query("SELECT id FROM trips")) == 1
+    # olemassa olevan asennuksen päälle ei tuoda
+    export_package(old, share)
+    assert not import_package_if_fresh(new, share)

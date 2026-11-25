@@ -376,5 +376,11 @@ def load_settings(path: str | None = None) -> Settings:
     options = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     if not p.exists():
         _LOG.warning("Asetustiedostoa %s ei löydy, käytetään oletuksia", path)
+    from .transfer import import_package_if_fresh
+
+    try:
+        import_package_if_fresh(data_dir, options.get("export_dir") or Settings.export_dir)
+    except Exception:
+        _LOG.exception("Siirtopaketin tuonti epäonnistui")
     store = VehicleStore(data_dir).load_or_migrate(options)
     return parse_settings(options, data_dir=data_dir, store=store)

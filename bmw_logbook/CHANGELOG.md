@@ -1,5 +1,8 @@
 # Muutosloki
 
+## 0.3.1
+- Siirtopaketti: Asetukset-sivun *Kirjoita siirtopaketti* tallentaa autot, tietokannat ja tilat kansioon `<raporttikansio>/.siirto/`. Toisesta reposta asennettu lisäosa tuo paketin ensimmäisellä käynnistyksellä, jos sen omat tiedot ovat tyhjät. Tarvitaan siirryttäessä julkiseen CarData Logbook -versioon.
+
 ## 0.3.0
 - Autot löytyvät automaattisesti Home Assistantin CarData-integraatiosta VIN:n perusteella. Entiteettejä ei tarvitse etsiä käsin, ja käsin syötetty entiteetti ohittaa löydetyn.
 - Uusi Autot-sivu: autojen lisäys ja muokkaus (rekisteritunnus, kuljettaja, käyttövoima, polttoaine, lataustauko, entiteetit) ja uudelleenkäynnistys selaimesta. Autot tallennetaan tiedostoon `/data/vehicles.json`.
