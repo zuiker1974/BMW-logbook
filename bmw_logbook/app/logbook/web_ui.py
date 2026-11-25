@@ -719,6 +719,16 @@ def create_app(app_state, restrict: bool | None = None) -> FastAPI:
         app_state.restart_needed = True
         return redirect(request, "/vehicles", msg="Kotilaturi tallennettu.")
 
+    @api.post("/transfer/export")
+    async def transfer_export(request: Request):
+        from .transfer import export_package
+
+        try:
+            path = export_package(app_state.settings.data_dir, app_state.settings.export_dir, app_state.services)
+        except Exception as exc:
+            return redirect(request, "/settings", err=f"Siirtopaketin kirjoitus epäonnistui: {exc}")
+        return redirect(request, "/settings", msg=f"Siirtopaketti kirjoitettu: {path}. Pysäytä tämä lisäosa ennen kuin käynnistät uuden.")
+
     @api.post("/restart")
     async def restart(request: Request):
         import asyncio

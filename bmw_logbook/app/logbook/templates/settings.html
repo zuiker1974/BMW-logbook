@@ -9,6 +9,13 @@
   CarData-yhteys: {{ app.stream_state or 'ei tietoa' }} ·
   MQTT-sensorit: {{ 'käytössä' if app.mqtt else 'ei käytössä' }} · Raporttikansio: <code>{{ settings.export_dir }}</code></p>
 </div>
+<div class="card">
+  <h3 style="margin-top:0">Siirto toiseen asennukseen</h3>
+  <p class="small">Kun vaihdat lisäosan toisesta reposta asennettuun versioon, kirjoita ensin siirtopaketti. Uusi lisäosa tuo sen
+  ensimmäisellä käynnistyksellä (autot, matkat, kulut, lukitukset ja muutosloki). Pysäytä tämä lisäosa paketin jälkeen.</p>
+  <form method="post" action="{{ base }}/transfer/export"><button class="secondary">Kirjoita siirtopaketti</button>
+  <span class="small muted">→ <code>{{ settings.export_dir }}/.siirto/</code></span></form>
+</div>
 {% for c in cars %}
 <div class="card">
   <h2>{{ c.v.display_name }} · {{ c.v.plate or "rekisteritunnus puuttuu" }} ({{ c.v.id }})</h2>
